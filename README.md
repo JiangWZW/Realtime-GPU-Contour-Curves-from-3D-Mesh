@@ -1,6 +1,6 @@
 # StrokeGen: Realtime GPU Contour Curve Generation from Mesh  
 
-<img src="/Abstract Submit Image.png" alt="Abstract Submit Image" style="zoom: 1%;" />
+<img src="/Abstract Submit Image.png" width="600" alt="Abstract Submit Image" style="zoom: 1%;" />
 
 See our paper at EGSR 2022: XXXXXXXX
 
