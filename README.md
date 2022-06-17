@@ -36,8 +36,7 @@ Currently only support to render a **single static mesh**. However, in theory, i
 
 ### Temporal Coherence 
 
-Strokes can change quickly under animation.
-I’ve spent a year working on a optimizer to generate smooth stroke animation. It is removed in this branch. I’ll upload that in the future.
+I’ve worked over a year on an real-time optimizer for smooth stroke animation. Due to its massive complexity, I decided not to upload the newest branch. Hence, strokes can change quickly under animation in this version.
 
 ### Stroke Styles
 
