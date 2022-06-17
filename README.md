@@ -40,7 +40,7 @@ I’ve worked over a year on an real-time optimizer for smooth stroke animation.
 
 ### Stroke Styles
 
-I removed stamping (similar to paint brush in Photoshop) style, only kept the sweeping (similar to brush path in Illustrator), since the branch for stamping is kind of messy.
+I removed stamping (similar to paint brush in Photoshop) style, only kept the sweeping (similar to brush path in Illustrator), since the branch for stamping is kind of messy. For details, see “Assets\Resources\ShaderLibrary\BrushToolBox.hlsl”
 
 ## Compatibility
 
