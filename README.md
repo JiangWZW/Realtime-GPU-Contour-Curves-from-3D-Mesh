@@ -14,7 +14,7 @@ No existing GPU-based NPR method (inverted hull, post-processing, etc.) can gene
 
 ## How to setup
 
-StrokeGen is a research prototype, developed in Unity Engine, with its Universal Render Pipeline.
+This project is developed in Unity Engine, with its Universal Render Pipeline.
 All runtime procedures are implemented on the GPU with HLSL (mainly compute shaders). 
 
 To run this project:
