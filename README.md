@@ -1,6 +1,6 @@
 # StrokeGen: Realtime GPU Contour Curve Generation from Mesh  
 
-| <img src=".\Abstract Submit Image.png" width = 500 alt="Abstract Submit Image" style="zoom: 33%;" /> |
+| <img src=".\Abstract Submit Image.png" alt="Abstract Submit Image" width = 500 style="zoom: 33%;" /> |
 | :----------------------------------------------------------: |
 |       <b>Generated strokes with different colors</b>.        |
 
@@ -8,7 +8,7 @@ No existing GPU-based NPR method (inverted hull, post-processing, etc.) can gene
 
 *StrokeGen*, a real-time method to generate 2D curves from 3D mesh’s contour:
 
-- Reaches up to 800x acceleration over CPU-based offline alternatives ([Pencil+4](https://www.psoft.co.jp/jp/product/pencil/unity/), [Line Art](https://docs.blender.org/manual/en/latest/grease_pencil/modifiers/generate/line_art.html), [Freestyle](https://docs.blender.org/manual/en/latest/render/freestyle/introduction.html#:~:text=Freestyle%20is%20an%20edge%2Fline,technical%20(hard%20line)%20looks.), [Active Strokes](https://github.com/benardp/ActiveStrokes)). Only costs 1ms for mesh of 300k tris, under 1920x1080 screen resolution.
+- Reaches up to 800x acceleration over CPU-based offline alternatives ([Pencil+4](https://www.psoft.co.jp/jp/product/pencil/unity/), [Line Art](https://docs.blender.org/manual/en/latest/grease_pencil/modifiers/generate/line_art.html), [Freestyle](https://docs.blender.org/manual/en/latest/render/freestyle/introduction.html#:~:text=Freestyle%20is%20an%20edge%2Fline,technical%20(hard%20line)%20looks.), [Active Strokes](https://github.com/benardp/ActiveStrokes)). It is crazily fast: only costs 1ms for mesh of 300k tris, under 1920x1080 screen resolution.
 - Produces stroke curves comparable to these CPU-based approaches.
 
 ## How to setup
@@ -39,3 +39,5 @@ To run this project:
 ## Compatibility
 
 Tested on Windows, with Nnvidia GPUs (GTX 1070, GTX 1080, Quadro M2000). 
+
+Any questions or problems, email 3284829455@qq.com. June 17, 2022
