@@ -1,4 +1,4 @@
-# StrokeGen: Realtime GPU Contour Curve Generation from Mesh  
+# StrokeGen: Realtime Contour Curve Generation 
 
 | <img src=".\Abstract Submit Image.png" alt="Abstract Submit Image" width = 500 style="zoom: 33%;" /> |
 | :----------------------------------------------------------: |
@@ -30,12 +30,18 @@ To run this project:
 
 ​	For more details, please refer to our paper at EGSR 2022: XXXXXXXX
 
-- Currently only support to render a **single static mesh**. However, in theory, it can be adapted for a skeletal mesh easily. Multiple mesh is also possible, but I’m too lazy to deal with the mesh api in Unity.
-- **Temporal Coherence**
-  Strokes can change quickly under animation.
-  I’ve spent a year working on a optimizer to generate smooth stroke animation. It is removed in this branch. I’ll upload that in the future.
-- **Stroke Styles**
-  I removed stamping (similar to paint brush in Photoshop) style, only kept the sweeping (similar to brush path in Illustrator), since the branch for stamping is kind of messy.
+### Supported Mesh Type
+
+Currently only support to render a **single static mesh**. However, in theory, it can be adapted for a skeletal mesh easily. Multiple meshes is also possible, but I’m too lazy to deal with the mesh api in Unity.
+
+### Temporal Coherence 
+
+Strokes can change quickly under animation.
+I’ve spent a year working on a optimizer to generate smooth stroke animation. It is removed in this branch. I’ll upload that in the future.
+
+### Stroke Styles
+
+I removed stamping (similar to paint brush in Photoshop) style, only kept the sweeping (similar to brush path in Illustrator), since the branch for stamping is kind of messy.
 
 ## Compatibility
 
