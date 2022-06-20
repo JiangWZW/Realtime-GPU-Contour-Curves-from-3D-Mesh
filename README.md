@@ -28,7 +28,7 @@ To run this project:
 
 ## Implementation Notes
 
-​	For more details, please refer to our paper at EGSR 2022: XXXXXXXX
+​	For more details, please refer to our paper “GPU-Driven Real-Time Mesh Contour Vectorization” at EGSR 2022.
 
 ### Supported Mesh Type
 
