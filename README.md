@@ -1,6 +1,6 @@
 # StrokeGen: Realtime Contour Curve Generation 
 
-| <img src="D:\Realtime-GPU-Contour-Curves-from-3D-Mesh\README.assets\Abstract Submit Image.png" alt="Abstract Submit Image" width = 500 style="zoom: 33%;" /> |
+| <img src="\Abstract Submit Image.png" alt="Abstract Submit Image" width = 500 style="zoom: 33%;" /> |
 | :----------------------------------------------------------: |
 |       <b>Generated strokes with different colors</b>.        |
 
