@@ -1,0 +1,133 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel StampContourCoarseCullingOptimize_Filtering
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourCoarseCullingOptimizeComputeDefs.hlsl"
+
+// #define DEBUG_OPTI_ORIENT
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawStampLinkage;
+RWByteAddressBuffer CBuffer_BufferRawRasterDataPerSeg;
+
+#define FILTER_RADIUS 8
+
+
+[numthreads(GROUP_SIZE_CONV, 1, 1)]
+void StampContourCoarseCullingOptimize_Filtering(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID
+)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+#define EdgeId ((min(EdgeCount - 1, id.x)))
+
+	// Load Edge Attribs
+	uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(3, EdgeId)
+	);;
+	bool despeckled = GetEdgeAttrib(
+		BIT_BEG_DEL_FLAG, BIT_LEN_DEL_FLAG,
+		edgeAttribs
+	);
+	EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage,
+		EdgeId
+	);
+
+	// Load Stamp Coord
+	uint stampCoordPacked = CBuffer_BufferRawStampPixels.Load(
+		CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo));
+
+
+
+	ConvolutionData convData;
+	SetupSegmentedConvolution_OrientCurrFrame(
+		gIdx, groupIdx, EdgeCount,
+		/*out*/convData
+	);
+
+
+	float countVisible = (convData.orientScore >= 0);
+	float countCulled = (convData.orientScore < 0);
+	[unroll]
+	for (uint d = 1; d < FILTER_RADIUS; ++d)
+	{
+		ConvolutionData neighData;
+
+		neighData = LoadLDSConvData_AtLeft_OrientCurrFrame(
+			d,
+			gIdx.x, groupIdx,
+			edgeloop.length, edgeloop.headEdgeId
+		);
+		countVisible += (neighData.orientScore >= 0);
+		countCulled += (neighData.orientScore < 0);
+
+
+		neighData = LoadLDSConvData_AtRight_OrientCurrFrame(
+			d,
+			gIdx.x, groupIdx,
+			edgeloop.length, edgeloop.headEdgeId
+		);
+		countVisible += (neighData.orientScore >= 0);
+		countCulled += (neighData.orientScore < 0);
+	}
+
+
+	bool oriented =
+		(!despeckled) &&
+		F32_TO_U32(countVisible) >= 2 + F32_TO_U32(countCulled);
+	
+	SetEdgeAttrib(
+		oriented,
+		BIT_BEG_DRAW_FLAG, BIT_LEN_DRAW_FLAG,
+		edgeAttribs
+	);
+	SetEdgeAttrib(
+		oriented,
+		BIT_BEG_ORIENT_FLAG, BIT_LEN_ORIENT_FLAG,
+		edgeAttribs
+	);
+	// SetEdgeAttrib(
+	// 	(!despeckled) &&
+	// 	edgeConvData.dualOrientScore > 0,
+	// 	BIT_BEG_AMBIGUOUS, BIT_LEN_AMBIGUOUS,
+	// 	edgeAttribs
+	// );
+	
+
+	if (id.x < EdgeCount)
+	{
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(
+				0, EdgeId
+			),
+			edgeAttribs
+		);
+		 
+
+#ifdef DEBUG_OPTI_ORIENT
+		EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+		uint stampCoordPacked = CBuffer_BufferRawStampPixels.Load(
+			CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo));
+		float2 stampCoord = DecodePixelCoord(stampCoordPacked);
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+		float4 dbgCol;
+		
+		dbgCol = oriented ? COL_G : COL_R;
+
+		_DebugTexture1[edgeCoord] = dbgCol;
+#endif
+	}
+
+}
+

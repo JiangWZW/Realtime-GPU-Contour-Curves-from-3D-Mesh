@@ -1,0 +1,18 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Clear_Uint
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+float4   _TextureParams;
+
+// R32int texture
+RWTexture2D<int> _Target_Uint;
+int    _ClearVal_Uint;
+
+[numthreads(32,32,1)]
+void Clear_Uint (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < (uint)_TextureParams.x && id.y < (uint)_TextureParams.y){
+        _Target_Uint[id.xy] = _ClearVal_Uint;
+    }
+}

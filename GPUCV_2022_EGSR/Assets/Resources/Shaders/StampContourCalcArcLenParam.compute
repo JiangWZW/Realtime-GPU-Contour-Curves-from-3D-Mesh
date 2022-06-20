@@ -1,0 +1,352 @@
+﻿#pragma kernel StampContourCalcArcLenParam_UpSweep
+#pragma kernel StampContourCalcArcLenParam_Reduce
+#pragma kernel StampContourCalcArcLenParam_DwSweep
+#pragma kernel StampContourCalcArcLenParam_PathArcParam
+
+
+#pragma use_dxc
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourCalcArcLenParamComputeDefs.hlsl"
+
+// #define DEBUG_UPSWEEP 
+// #define DEBUG_PATH_ARC_PARAM
+
+ByteAddressBuffer CBuffer_BufferRawStampLinkage;
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawProceduralGeometry;
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+
+StructuredBuffer<uint> CBuffer_CachedArgs;
+StructuredBuffer<uint> CBuffer_CachedArgs1;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgs;
+
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+
+
+#define EdgeId (id.x)
+
+void LoadPathLengthAndRank(uint edgeId, out uint pathRank, out uint pathLen)
+{
+	return CBuffer_PixelEdgeData_EdgeParam_LoadAll(
+		CBuffer_BufferRawPixelEdgeData,
+		EDGE_PARAM_BRUSH_PATH,
+		edgeId,
+		// out -------------------
+		pathRank, pathLen
+	);
+}
+
+
+#define NUM_SCAN_BLOCKS_MAX 2048
+uint ComputeGlobalScanBufferOffset(uint scanItemCount)
+{
+	return
+		(scanItemCount << BITS_BLOCK_OFFSET) +	// float4 data
+		(scanItemCount << BITS_WORD_OFFSET) +	// uint hf
+		(scanItemCount << BITS_BLOCK_OFFSET);	// extra spacing for safety
+}
+uint ComputeReductionBufferOffset()
+{
+	return
+		(NUM_SCAN_BLOCKS_MAX << BITS_BLOCK_OFFSET) + // data
+		(NUM_SCAN_BLOCKS_MAX << BITS_WORD_OFFSET) + // hf
+		(NUM_SCAN_BLOCKS_MAX << BITS_WORD_OFFSET);	// extra
+}
+
+
+#define EdgeId (id.x)
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourCalcArcLenParam_UpSweep(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+	bool validThread = (EdgeId < EdgeCount);
+
+	// TODO: for just a edge loop head test, this is TOO EXPENSIVE
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage, EdgeId
+	);
+	bool hf = validThread && (
+		// edge-loop start
+		EdgeId == edgeloop.headEdgeId
+		
+		// Note: this won't work
+		// 'cause this bit is already replaced by sth. else
+		// 0 != (EDGE_SEG_FLAG_HEAD_BIT & flagEdgeLoopHeadTail) // edgeloop start
+	);
+	
+	uint distToPrevEdgePacked = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_ArcLenParam_AddrAt(EdgeId)
+	);
+	float deltaArcLen = validThread ? asfloat(distToPrevEdgePacked) : 0;
+	SegScanInc_UpSweep_ArcLenParam(
+		id, groupIdx, gIdx,
+		LS_SCAN_BUFFER,
+		CBuffer_BufferRawLookBacks,
+		0, 0,
+		true,
+		deltaArcLen, hf,
+		EdgeCount
+	);
+}
+
+
+
+[numthreads(1024, 1, 1)]
+void StampContourCalcArcLenParam_Reduce(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	SegScanReduction_ArcLenParam(
+		CBuffer_BufferRawLookBacks,
+		0, groupIdx
+	);
+}
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourCalcArcLenParam_DwSweep(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+
+	uint gIdxScanItem = EdgeId / GROUP_SIZE_0;
+	float segscanRes = SegScanDwSweep_ArcLenParam(
+		EdgeId.xxx, gIdxScanItem.xxx,
+		LS_SCAN_BUFFER,
+		CBuffer_BufferRawLookBacks,
+		0, 0,
+		EdgeCount
+	);
+	float edgeloopArcParam = segscanRes;
+
+	
+	if (EdgeId < EdgeCount)
+	{
+		// Store arc-len parametrization
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_EdgeLoopArcLenParam_AddrAt(EdgeId),
+			asuint(edgeloopArcParam)
+		);
+	}
+
+#ifdef DEBUG_DWSWEEP
+	uint edgeAttribsRaw =
+		CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+		);
+	EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribsRaw);
+	float2 stampCoord = (float2)
+		DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+			CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo))
+		);
+	float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+
+	
+	if (EdgeId < EdgeCount)
+	{
+		float4 dbgCol = ?;
+		if (drawFlag)
+		{
+			_DebugTexture[edgeCoord] = dbgCol;
+		}
+
+		dbgCol = ?;
+		if (drawFlag)
+		{
+			_DebugTexture1[edgeCoord] = dbgCol;
+		}
+	}
+#endif
+}
+
+
+float LoadEdgeLoopArcParam(uint edgeId)
+{
+	return asfloat(CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_EdgeLoopArcLenParam_AddrAt(edgeId)
+	));
+}
+
+// Consider an edge-loop:
+// E0 -> E1 -> E2 -> E3
+// /\                ||
+// ||                \/
+// E7 <- E6 <- E5 <- E4
+//
+// Address begin from E0 to E7;
+// [E0, E1, E2, E3, E4, E5, E6, E7]
+//
+// Path Segmentation:
+// *A -> *A -> *B -> *B
+// /\                ||
+// ||                \/
+// *A <- *A <- *C <- *B
+// ___A__]  [____B____] [C] [__A___
+// [*A, *A, *B, *B, *B, *C, *A, *A]
+//
+// Let Dij be Ei to Ej 's arc-len distance;
+// DeltaArcLen of each edge:
+// [D70, D01, D21, D32, ... , D56, D67]
+// edgeloopArcParam is generated by applying
+// an inclusive +scan:
+// [0,   D01, D02, D03, ... , D06, D07] + D70
+// 
+// For internal path:
+// -------------------------------------------------------
+// pathArcParam = edgeloopArcParam[edge] - [pathHead];
+// pathArcLen   = edgeloopArcParam[pathTail] - [pathHead];
+//
+// For path across edge-loop's end to begin:
+// (for example, path A)
+// -------------------------------------------------------
+// pathArcLen   = edgeloopArcParam[pathTail] + [loopEnd] - [pathHead];
+// (1 if edge is in left-half,
+//    e.g, E0, E1 belongs to left of path A
+// pathArcParam =
+//		edgeloopArcParam[edge] - [loopBeg]
+//	  + edgeloopArcParam[loopEnd] - [pathHead];
+// (2 if edge is in right-half,
+//    e.g, E6, E7 belongs to left of path A
+// pathArcParam follows the same scheme as a internal path;
+void ComputePathArcParams(
+	uint edgeId, EdgeLoopTopology edgeloop, float edgeloopArcParam, 
+	uint pathRank, uint pathLen,
+	out float pathArcParam, out float pathArcLen
+) {
+	float edgeloopArcParam_loopTail = LoadEdgeLoopArcParam(edgeloop.tailEdgeId);
+
+	uint pathHeadEdgeId = MoveEdgeIdAlongEdgeLoop(
+		edgeloop, edgeId, -((float)pathRank)
+	);
+	float edgeloopArcParam_pathHead = LoadEdgeLoopArcParam(pathHeadEdgeId);
+
+	uint pathTailEdgeId = MoveEdgeIdAlongEdgeLoop(
+		edgeloop, edgeId, -((float)pathRank) + (float)(pathLen - 1)
+	);
+	float edgeloopArcParam_pathTail = LoadEdgeLoopArcParam(pathTailEdgeId);
+	
+
+	// path split to both sides of the edgeloop,
+	bool bisectedPath_left = 
+		(edgeloop.headEdgeId + pathRank) > edgeId;
+	bool bisectedPath_right = 
+		((edgeId - pathRank) + pathLen - 1) > edgeloop.tailEdgeId;
+
+	
+	pathArcLen =
+		edgeloopArcParam_pathTail - edgeloopArcParam_pathHead;
+	if (bisectedPath_left || bisectedPath_right)
+	{
+		pathArcLen =
+			edgeloopArcParam_pathTail
+			+ edgeloopArcParam_loopTail - edgeloopArcParam_pathHead;
+	}
+
+	
+	pathArcParam =
+		edgeloopArcParam - edgeloopArcParam_pathHead;
+	if (bisectedPath_left)
+	{
+		pathArcParam =
+			edgeloopArcParam 
+			+ edgeloopArcParam_loopTail - edgeloopArcParam_pathHead;
+	}
+		
+}
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourCalcArcLenParam_PathArcParam(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage, EdgeId
+	);
+
+
+	uint pathRank, pathLen;
+	LoadPathLengthAndRank(EdgeId, pathRank, pathLen);
+
+
+	float edgeloopArcParam = LoadEdgeLoopArcParam(EdgeId);
+	
+
+	float pathArcParam, pathArcLen;
+	ComputePathArcParams(
+		EdgeId, edgeloop, edgeloopArcParam, 
+		pathRank, pathLen,
+		// out ---
+		pathArcParam, pathArcLen
+	);
+
+	
+	if (EdgeId < EdgeCount)
+	{
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_ArcLenParam_AddrAt(EdgeId),
+			asuint(pathArcParam)
+		);
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_PathArcLen_AddrAt(EdgeId),
+			asuint(pathArcLen)
+		);
+
+#ifdef DEBUG_PATH_ARC_PARAM
+		uint edgeAttribsRaw =
+			CBuffer_BufferRawPixelEdgeData.Load(
+				CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+			);
+		bool drawFlag = (
+			1 == GetEdgeAttrib(
+				BIT_BEG_DRAW_FLAG,
+				BIT_LEN_DRAW_FLAG,
+				edgeAttribsRaw
+			)) && (EdgeId < EdgeCount);
+		EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribsRaw);
+		float2 stampCoord = (float2)
+			DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo))
+			);
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+		
+		uint pathHeadEdgeId = MoveEdgeIdAlongEdgeLoop(
+			edgeloop, EdgeId, -((float)pathRank)
+		);
+
+		uint pathTailEdgeId = MoveEdgeIdAlongEdgeLoop(
+			edgeloop, EdgeId, -((float)pathRank) + (float)(pathLen - 1)
+		);
+		float4 dbgCol = float4(
+			EdgeId, 
+			pathHeadEdgeId, pathTailEdgeId, 
+			edgeloop.headEdgeId
+		);
+		if (drawFlag)
+		{
+			_DebugTexture[edgeCoord] = dbgCol;
+
+			bool bisectedPath_left =
+				(edgeloop.headEdgeId + pathRank) > EdgeId;
+			bool bisectedPath_right =
+				((EdgeId - pathRank) + pathLen - 1) > edgeloop.tailEdgeId;
+			_DebugTexture1[edgeCoord] = float4(
+				pathArcParam, edgeloopArcParam, 
+				bisectedPath_left, 
+				flagEdgeLoopHeadTail & EDGE_SEG_FLAG_HEAD_BIT
+			);
+		}
+#endif
+	}
+}

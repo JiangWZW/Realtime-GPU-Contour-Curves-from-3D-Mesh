@@ -1,0 +1,233 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ContourExtraction_ClearArgs
+#pragma kernel ContourExtraction_VertLevel
+#pragma kernel ContourExtraction_FaceLevel
+#pragma kernel ContourExtraction_EdgeLevel
+
+#pragma use_dxc
+//-////////////////////////////////////----------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+//                                  RESOURCES                                 //
+////////////////////////////////////////////////////////////////////////////////
+
+#include "../ShaderLibrary/CustomComputeInputs.hlsl"
+#include "../ShaderLibrary/FrameCounter.hlsl"
+#include "../ShaderLibrary/ComputeKernelConfigs/ExtractionComputeDefs.hlsl"
+
+// #define DEBUG_CAMERA_ROTATION 1
+
+RWByteAddressBuffer         CBuffer_BufferRawPerVert;
+RWByteAddressBuffer         CBuffer_BufferRawPerFace;
+RWByteAddressBuffer         CBuffer_BufferRawPerEdge;
+RWByteAddressBuffer         CBuffer_BufferRawFlagsPerEdge;
+RWByteAddressBuffer         CBuffer_BufferRawLookBacks;
+RWByteAddressBuffer         CBuffer_BufferRawLookBacks1;
+
+RWStructuredBuffer<uint>    CBuffer_CachedArgs;
+RWStructuredBuffer<uint>    CBuffer_CachedArgs1;
+RWStructuredBuffer<uint>    CBuffer_FaceDrawIndirectArgs;
+RWStructuredBuffer<uint>    CBuffer_StructuredTempBuffer;
+RWStructuredBuffer<uint>    CBuffer_StructuredTempBuffer1;
+
+[numthreads(32, 1, 1)]
+void ContourExtraction_ClearArgs(
+    uint3 id : SV_DispatchThreadID
+)
+{
+	if (id.x < 4)
+	{
+        CBuffer_CachedArgs[id.x] = 0;
+        CBuffer_CachedArgs1[id.x] = 0;
+    }
+    if (id.x < 32)
+    {
+        CBuffer_StructuredTempBuffer[id.x] = 0;
+    }
+	if (id.x == 0)
+	{
+		CBuffer_EdgeLoopCounter = 0;
+        // cleanup before JFA kernel,
+        CBuffer_JFATileCounter = 0;
+        // Used for coverage test
+        CBuffer_PBDMaximumSpringLength = 0;
+        CBuffer_PBDMaximumStrokeLength = 0;
+        CBuffer_PBDSpringSegmentCounter = 0;
+        CBuffer_ParticlCoverageSpineCounter = 0;
+        CBuffer_ContourCoverageSpineCounter = 0;
+	}
+    if ((id.x == 0) && (_FrameCounter <= 2))
+    {
+        CBuffer_PBDParticleCounter = 0;
+
+    	// Geo
+        ID_SubBuff_Active(ParticlePosition) = 0u;
+        ID_SubBuff_Cached(ParticlePosition) = 1u;
+
+        ID_SubBuff_Active(SpringAABB) = 0u;
+        ID_SubBuff_Cached(SpringAABB) = 1u;
+
+        ID_SubBuff_Active(ParticleTangent) = 0u;
+        ID_SubBuff_Cached(ParticleTangent) = 1u;
+
+        ID_SubBuff_Active(ParticleTemporalVisibility) = 0u;
+        ID_SubBuff_Cached(ParticleTemporalVisibility) = 1u;
+
+        // Topo
+        ID_SubBuff_Active(ParticleState) = 0u;
+        ID_SubBuff_Cached(ParticleState) = 1u;
+     
+        ID_SubBuff_Active(SpringLength) = 0u;
+        ID_SubBuff_Cached(SpringLength) = 1u;
+    }
+
+}
+
+float4x4 unity_MatrixVP;
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ContourExtraction_VertLevel (
+    uint3 id : SV_DispatchThreadID
+)
+{
+    float4 vertPos = CBuffer_VPList[id.x];
+    vertPos.w = 1.0;
+    vertPos = mul(CMatrix_M, vertPos);
+    vertPos = mul(CMatrix_VP, vertPos);
+
+    CBuffer_BufferRawPerVert.Store4(
+        CBuffer_BufferRawPerVert_VP_AddrAt(id.x), 
+        asuint(vertPos)
+    );
+}
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+//                            Per Face Pass                                   //
+////////////////////////////////////////////////////////////////////////////////
+// == Shader Resources ==========================================
+
+groupshared uint LDS_PrevGroupSum = 0;
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ContourExtraction_FaceLevel (
+    uint3 id : SV_DispatchThreadID,
+    uint groupIdx : SV_GroupIndex,
+    uint3 gid : SV_GroupID)
+{
+    uint faceId = id.x;
+    bool validThread = faceId < CVal_Triangle_Count;
+    uint vertId = CBuffer_TVList.Load(CBuffer_TVList_AddrAtPrimID(faceId));
+    
+    // Compute Face Orientation ----------------------------------
+    float3 faceNormal = CBuffer_TNList[faceId].xyz;
+    float3 posV0_OS = CBuffer_VPList[vertId].xyz;
+    float3 viewDir_OS = CVector_CameraPos_OS.xyz - posV0_OS;
+	float cosTheta = dot(faceNormal, normalize(viewDir_OS));
+    if (validThread)
+    {
+        CBuffer_BufferRawPerFace.Store(
+            CBuffer_BufferRawPerFace_AddrAt(faceId),
+            asuint(cosTheta)
+        );
+    }
+
+
+	// // Back-face Culling --------------------------------------------------------------
+ //    // Don't change, this works; Don't ask why, I don't know, either.
+ //    bool frontFace = validThread ? 0 > cosTheta : false;
+ //
+	// uint compactAddr = ScanBlockExcBackFaceCullBin(frontFace, groupIdx);
+	// if (groupIdx == GROUP_SIZE - 1)
+	// {
+ //        InterlockedAdd(CBuffer_FrontFaceCounter, compactAddr + frontFace, LDS_PrevGroupSum);
+	// }
+ //    GroupMemoryBarrierWithGroupSync();
+ //
+ //    compactAddr += LDS_PrevGroupSum;
+	//
+ //    if (frontFace)
+ //    {
+ //        CBuffer_BufferRawPerFace.Store(
+ //            CBuffer_BufferRawPerFace_Subbuff_AddrAt(CVal_Triangle_Count, compactAddr),
+ //            faceId
+ //        );
+ //    }
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+//                          Per Edge Pass                                     //
+////////////////////////////////////////////////////////////////////////////////
+// #define RENDER_CONCAVE_EDGES
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ContourExtraction_EdgeLevel (
+    uint3 id : SV_DispatchThreadID)
+{
+#ifdef RENDER_CONCAVE_EDGES
+    bool isConcaveEdge = id.x >= (uint)CVal_NonConcaveEdge_Count;
+    bool isBoundaryEdge = (!isConcaveEdge) && (id.x >= (uint)CVal_NormalEdge_Count);
+#else	
+    bool isConcaveEdge = id.x >= (uint)CVal_NonConcaveEdge_Count;
+    bool isBoundaryEdge = (!isConcaveEdge) && (id.x >= (uint)CVal_NormalEdge_Count);
+#endif
+
+    // TODO: Only do further investigation for convex edges & boundary edges
+    // Load Data
+    uint ldAddr = CBuffer_ETList_AddrAt(id.x);
+    uint2 ldEdgeData = CBuffer_ETList.Load2(ldAddr);
+
+    uint ldFaceData[2]; // Adj. face indices
+    ldFaceData[0] = 
+        CBuffer_BufferRawPerFace.Load(CBuffer_BufferRawPerFace_AddrAt(ldEdgeData.x));
+    ldFaceData[1] =
+        CBuffer_BufferRawPerFace.Load(CBuffer_BufferRawPerFace_AddrAt(ldEdgeData.y));
+    // <<----------- Test for phase I: check data coherence in RenderDoc
+
+    float faceCos0 = asfloat(ldFaceData[0]);
+    float faceCos1 = asfloat(ldFaceData[1]);
+    bool isContour = 
+        (faceCos0 * faceCos1 <= 0);
+    isContour = isBoundaryEdge ? true : isContour;
+#ifndef RENDER_CONCAVE_EDGES
+    isContour = isConcaveEdge ? false : isContour;
+#endif
+
+
+
+	// Store
+    uint strAddr = CBuffer_BufferRawPerEdge_AddrAt(id.x);
+    uint strData = (uint)(isContour);
+    CBuffer_BufferRawPerEdge.Store(strAddr, isContour);
+    
+    strAddr = CBuffer_BufferRawFlagsPerEdge_AddrAt(id.x);
+    strData = (IS_FRONT_FACE(faceCos0) ? 0 : 1);
+    strData <<= 1;
+    strData |= isContour;
+    CBuffer_BufferRawFlagsPerEdge.Store(strAddr, strData);
+
+    // --------------------------------------------------
+    if (id.x < 4096){
+        // I don't know why, but this works for solving
+        // blinking artifact, which caused by device-level 
+        // scan in ContourPixelExtraction.hlsl,
+        // 
+        // Suspect it's because lookback buffer with
+        // 2 sub buffers suffers from L2 caching issues, 
+        // though it's declared with "globally coherent",
+        // in theory, all r/w bypasses L1 cache to L2.
+        // 
+        // Another way to avoid this is 
+
+        CBuffer_BufferRawLookBacks.Store(id.x << 2, 0);
+        CBuffer_BufferRawLookBacks1.Store(id.x << 2, 0);
+    }
+	if (id.x == 0)
+	{
+        CBuffer_FaceDrawIndirectArgs[0] = 3 * CBuffer_FrontFaceCounter;
+	}
+}
+
+// Not supported, what a shame.
+// https://forum.unity.com/threads/wave-intrinsics-support-for-compute-shader.824916/

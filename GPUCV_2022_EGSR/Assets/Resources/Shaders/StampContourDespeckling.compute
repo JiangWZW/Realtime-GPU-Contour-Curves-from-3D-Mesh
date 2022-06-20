@@ -1,0 +1,232 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma use_dxc
+
+#pragma kernel StampContourDespeckling_ComputeEdgeLoopArea
+#pragma kernel StampContourDespeckling_DeviceScanReduce
+#pragma kernel StampContourDespeckling_DeviceScanDownSweep
+#pragma kernel StampContourDespeckling_BroadcastLoopArea
+
+#define SCAN_DATA_TYPE_NON_UINT
+#define SCAN_BLOCK_SIZE GROUP_SIZE_0
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourDespecklingComputeDefs.hlsl"
+
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture1;
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+RWByteAddressBuffer CBuffer_BufferRawEdgeLoopData;
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawStampLinkage;
+RWByteAddressBuffer CBuffer_BufferRawRasterDataPerSeg;
+
+StructuredBuffer<uint> CBuffer_StructuredTempBuffer1;
+
+RWByteAddressBuffer CBuffer_BufferRawLookBacks;
+
+// #define DEBUG_EDGELOOP_AREA_LENGTH
+
+#define MIN_EDGELOOP_AREA (32)
+
+#define EdgeId (id.x)
+
+#define Add(x, y) ((x + y))
+#define Max(x, y) (max((x), (y)))
+#define INVALID_LOOK_BACK_VAL 0xffffffff
+
+
+// Scan Test Data
+//////////////////////////////////////////////////////////////////////////
+// --- Custom inputs ---
+#define REDUCED_BUFFER CBuffer_BufferRawLookBacks
+#define SCAN_BUFFER CBuffer_BufferRawRasterDataPerSeg
+
+#define SCAN_FUNCTION_TAG Despeckle
+#define SCAN_SCALAR_TYPE float
+#define SCAN_OP Add
+#define SCAN_ZERO_VAL 0
+
+
+// #define DEBUG_SCAN
+#define DEBUG_SEGSCAN
+
+
+uint ScanBufferOffset()
+{
+	return (EDGE_SCAN_BUFFER) + (EDGE_SCAN_LENGTH);
+}
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourDespeckling_ComputeEdgeLoopArea(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+#define EdgeId (id.x)
+	bool validThread = EdgeId < EdgeCount;
+	
+	uint2 data = CBuffer_BufferRawRasterDataPerSeg.Load2(				
+		CBuffer_PixelEdgeData_ScanWorkbench_AddrAt(EdgeId)					
+	);																			
+	float da; uint hf;	uint2 stampCoord;										
+	DecodeDifferentialAreaAndHF(data, hf, stampCoord, da);	
+	if (!validThread){			
+		da = 0;
+		hf = 1;
+	}										
+
+
+	uint3 scanVal = uint3(
+		asuint(da), 
+		validThread ? PackPixelCoord(stampCoord) : 0xffffffff, 
+		validThread ? PackPixelCoord(stampCoord) : 0u
+	);
+	SegScanInc_UpSweep_EdgeLoopAnalysis(
+		id, groupIdx, gIdx,
+		CBuffer_BufferRawRasterDataPerSeg,
+		CBuffer_BufferRawLookBacks,
+		ScanBufferOffset(),0, 
+		true,
+		scanVal, hf == 1, 
+		EdgeCount
+	);
+}
+#undef EdgeId
+
+[numthreads(1024, 1, 1)]
+void StampContourDespeckling_DeviceScanReduce(
+	uint groupIdx : SV_GroupIndex)
+{
+	SegScanReduction_EdgeLoopAnalysis(
+		CBuffer_BufferRawLookBacks, 0, groupIdx
+	);
+}
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourDespeckling_DeviceScanDownSweep(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	const uint EdgeLoopCount = CBuffer_EdgeLoopCounter;
+#define EdgeLoopId (id.x)
+	bool validThread = EdgeLoopId < EdgeLoopCount;
+	
+	// Use serialized linkage to find the tail edge,
+	// which contains exclusive-sum of the whole segment
+	uint tailEdgeId = CBuffer_BufferRawEdgeLoopData.Load(
+		CBuffer_EdgeLoopData_TailEdgeID_AddrAt(EdgeLoopId)
+	);
+	
+	uint3 res = SegScanDwSweep_EdgeLoopAnalysis(
+		uint3(tailEdgeId, 0, 0), 
+		uint3(tailEdgeId / GROUP_SIZE_0, 0, 0),
+		CBuffer_BufferRawRasterDataPerSeg,
+		CBuffer_BufferRawLookBacks,
+		ScanBufferOffset(), 0,
+		EdgeCount
+	);
+	float edgeLoopArea = asfloat(res.x);
+	// uint2 minCoord = DecodePixelCoord(res.y);
+	// uint2 maxCoord = DecodePixelCoord(res.z);
+
+	if (validThread)
+	{
+		CBuffer_BufferRawEdgeLoopData.Store(
+			CBuffer_EdgeLoopData_Temp_AddrAt(0, EdgeLoopId),
+			asuint(edgeLoopArea)
+		);
+		CBuffer_BufferRawEdgeLoopData.Store2(
+			CBuffer_EdgeLoopData_AABB_AddrAt(EdgeLoopId),
+			res.yz // (min_xy_packed, max_xy_packed)
+		);
+	}
+}
+#undef EdgeLoopId
+
+
+
+void Despeckling(uint edgeID, uint edgeCount)
+{
+	uint edgeLoopId = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_EdgeLoopID_AddrAt(edgeID)
+	);
+	float edgeLoopArea = asfloat(
+		CBuffer_BufferRawEdgeLoopData.Load(
+			CBuffer_EdgeLoopData_Temp_AddrAt(0, edgeLoopId)
+		)
+	);
+	bool outLoop = edgeLoopArea > 0;
+	edgeLoopArea = abs(edgeLoopArea);
+	// uint2 aabb = CBuffer_BufferRawEdgeLoopData.Load2(
+	// 	CBuffer_EdgeLoopData_AABB_AddrAt(edgeLoopId)
+	// );
+
+	float edgeLoopLen = CBuffer_BufferRawEdgeLoopData.Load(
+		CBuffer_EdgeLoopData_Length_AddrAt(edgeLoopId)
+	);
+
+
+	// Load edge attributes && set delete bit if edgeLoopArea is too small
+	uint edgeAttribsRaw = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, edgeID)
+	);
+
+	float areaLengthRatio = edgeLoopArea / edgeLoopLen;
+	bool despeckled = 
+		(edgeLoopArea < MIN_EDGELOOP_AREA) ||
+		(edgeLoopArea < (MIN_EDGELOOP_AREA * 2.0f) && areaLengthRatio <= 1.0);
+	
+	SetEdgeAttrib(
+		(uint)(despeckled),
+		BIT_BEG_DEL_FLAG, BIT_LEN_DEL_FLAG, 
+		edgeAttribsRaw /* inout */
+	);
+
+
+	// Store edge attributes updated with new flags
+	if (edgeID < edgeCount)
+	{
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, edgeID),
+			edgeAttribsRaw
+		);
+
+#ifdef DEBUG_EDGELOOP_AREA_LENGTH
+		EdgeAttrib edgeAttribs = DecodeEdgeAttrib(edgeAttribsRaw);
+		float2 stampCoord =
+			(float2)DecodePixelCoord(
+				CBuffer_BufferRawStampPixels.Load(
+					CBuffer_BufferRawStampPixels_AddrAt(edgeAttribs.stampInfo)));
+		float2 edgeCoord =
+			stampCoord +
+			MoveAtOppositeStamp(edgeAttribs.edgeDir);
+
+		uint2 minCorner = DecodePixelCoord(aabb.x);
+		uint2 maxCorner = DecodePixelCoord(aabb.y);
+		uint2 center = (minCorner + maxCorner) / 2;
+		float4 dbgCol = float4(
+			minCorner, 
+			maxCorner
+		);
+		
+		_DebugTexture1[edgeCoord] = dbgCol;
+#endif
+	}
+}
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourDespeckling_BroadcastLoopArea(
+	uint3 id : SV_DispatchThreadID
+)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	Despeckling(id.x, EdgeCount);
+}

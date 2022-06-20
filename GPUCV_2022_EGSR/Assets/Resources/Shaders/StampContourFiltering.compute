@@ -1,0 +1,447 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel StampContourFiltering_SetupSegmentation
+#pragma kernel StampContourFiltering_SetupDefragment
+#pragma kernel StampContourFiltering_ReMergeSegments
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourFilteringComputeDefs.hlsl"
+
+// #define DEBUG_STROKE_FILTERING
+// #define DEBUG_RESEGMENTATION
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+ByteAddressBuffer CBuffer_BufferRawProceduralGeometry;
+ByteAddressBuffer CBuffer_BufferRawFlagsPerStamp;
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawStampLinkage;
+RWByteAddressBuffer CBuffer_BufferRawRasterDataPerSeg;
+RWByteAddressBuffer CBuffer_BufferRawLookBacks;
+#define SCAN_BUFFER CBuffer_BufferRawRasterDataPerSeg
+// Tangent convoluted in StampContourTangent.compute
+#define CONV_PATCH_BUFFER CBuffer_BufferRawPixelEdgeData
+// #define CONV_PATCH_BUFFER CBuffer_BufferRawRasterDataPerSeg
+
+
+uint _DrawFlagBufferIndex; // Match with "~~Denoising2.compute"
+
+
+
+[numthreads(GROUP_SIZE_1, 1, 1)]
+void StampContourFiltering_SetupSegmentation(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+#define EdgeId ((id.x))
+
+	// Load Edge Attribs
+	uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+	);
+	uint historyDrawFlag =
+		// if this is stroke edge after history segmentation
+		GetEdgeAttrib(
+			BIT_BEG_DRAW_FLAG, BIT_LEN_DRAW_FLAG, 
+			edgeAttribs
+		);
+	uint niceOrient =
+		GetEdgeAttrib(
+			BIT_BEG_ORIENT_FLAG, BIT_LEN_ORIENT_FLAG,
+			edgeAttribs
+		);
+	uint deleted =
+		GetEdgeAttrib(
+			BIT_BEG_DEL_FLAG, BIT_LEN_DEL_FLAG,
+			edgeAttribs
+		);
+	
+		
+
+	EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+	const float2 edgeDir =
+		UnpackUnitVector_2D(
+			CBuffer_BufferRawPixelEdgeData.Load(
+				CBuffer_PixelEdgeData_EdgeTangent_AddrAt(EdgeId)
+			)
+		);
+	// Load Stamp Coord
+	uint stampCoordPacked = CBuffer_BufferRawStampPixels.Load(
+		CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo));
+	
+
+	
+	bool drawFlag = ((1 == niceOrient) && (0 == deleted));
+	// Update draw flag for next segmentation passes
+	SetEdgeAttrib(
+		drawFlag,
+		BIT_BEG_DRAW_FLAG, BIT_LEN_DRAW_FLAG,
+		/* inout */edgeAttribs
+	);
+
+
+	if (EdgeId < EdgeCount)
+	{
+		// Fill Segmentation Key
+		uint subbuffID_segKeyInput = 0;
+		if (id.x == 0)
+		{
+			CBuffer_SubBuff_StrokeSegmentKey = subbuffID_segKeyInput;
+		}
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_SegmentKey_AddrAt(
+				subbuffID_segKeyInput, EdgeId
+			),
+			drawFlag ? 1 : STROKE_SEG_KEY_CULLED
+		);
+
+		
+
+#ifdef DEBUG_STROKE_FILTERING
+		float2 stampCoord = DecodePixelCoord(stampCoordPacked);
+		uint deletedFlag = GetEdgeAttrib(
+			BIT_BEG_DEL_FLAG, BIT_LEN_DEL_FLAG,
+			edgeAttribs
+		);
+
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+
+		if (EdgeId < EdgeCount)
+		{
+			_DebugTexture1[edgeCoord] = drawFlag ? COL_G : COL_B;
+				float4(historyDrawFlag, drawFlag, 0, 1);
+		}
+#endif
+	}
+}
+
+
+int _MinSegmentLength; // short segs will be culled
+// Each cluster of short seg are merged to one culled segment
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourFiltering_SetupDefragment(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+	uint segRank = 0;
+	uint segLength = 0;
+	CBuffer_PixelEdgeData_EdgeParam_LoadAll(
+		CBuffer_BufferRawPixelEdgeData,
+		EDGE_PARAM_STROKE, EdgeId,
+		segRank, segLength
+	);
+
+	uint edgeAttribAddr = 
+		CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(
+			0, EdgeId
+		);
+	uint attribs = CBuffer_BufferRawPixelEdgeData.Load(edgeAttribAddr);
+	EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(attribs);
+
+	bool drawFlag =	 // If this edge has the same orientation with its stamp
+		1 == GetEdgeAttrib(BIT_BEG_DRAW_FLAG, BIT_LEN_DRAW_FLAG, attribs);
+
+	// Segment Length Thresholding
+	bool drawEdge = // Oriented edge in a segment that is long enough
+		(drawFlag) &&
+		(segLength > (uint)_MinSegmentLength);
+
+	bool shouldDrawEdge = drawEdge;
+
+	SetEdgeAttrib(
+		shouldDrawEdge,
+		BIT_BEG_DRAW_FLAG, BIT_LEN_DRAW_FLAG,
+		attribs
+	);
+
+
+	if (EdgeId < EdgeCount)
+	{
+		// Fill Segmentation Key
+		uint subbuffID_segKeyInput = 0;
+		if (id.x == 0)
+		{
+			CBuffer_SubBuff_StrokeSegmentKey = subbuffID_segKeyInput;
+		}
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_SegmentKey_AddrAt(
+				subbuffID_segKeyInput, EdgeId
+			),
+			shouldDrawEdge ? 1 : STROKE_SEG_KEY_CULLED
+		);
+
+		// TODO: Legacy code, dont know if should remove this
+		// For debug (be able to switch between)
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(
+				0, EdgeId
+			),
+			attribs
+		);
+
+#ifdef DEBUG_SCAN_RESULT
+		float2 stampCoord = (float2)
+			DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo)));
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+
+		_DebugTexture[edgeCoord] =
+#endif
+			 
+	}
+}
+
+
+
+bool ShouldDrawEdge2(uint edgeAttribsRaw)
+{
+	uint drawBit = GetEdgeAttrib(
+		BIT_BEG_DRAW_FLAG, BIT_LEN_DRAW_FLAG, edgeAttribsRaw
+	);
+	return (drawBit == 1);
+}
+
+int _MinLargeSegLen;
+int _MaxSmallSegLen;
+// Lets say 3 adjacent segs A, B, C
+// B culled, A&C survived
+// when
+// 1) B is small enough < _MaxSmallSegLen
+// 2) A&C long enough > _MinLargeSegLen
+// B will be recovered to connect A and C
+[numthreads(GROUP_SIZE_NEXT, 1, 1)]
+void StampContourFiltering_ReMergeSegments(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+#define EdgeId id.x
+
+	uint edgeAttribsRaw =
+		CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+		);
+	uint drawThisSeg = ShouldDrawEdge2(edgeAttribsRaw);
+
+
+	// Load Linkage
+	// -----------------------------------------------------------
+	// Edge-Loop Topology
+	SerializedEdgeLinkage link = DecodeSerializedEdgeLinkage(
+		CBuffer_BufferRawStampLinkage.Load(
+			CBuffer_BufferRawEdgeSerializedLinkage_AddrAt(EdgeId)));
+	float edgeLoopTailId = EdgeId + OffsetToEdgeSegmentTail(link);
+
+	SerializedEdgeLinkage tailLink = DecodeSerializedEdgeLinkage(
+		CBuffer_BufferRawStampLinkage.Load(
+			CBuffer_BufferRawEdgeSerializedLinkage_AddrAt(edgeLoopTailId)));
+	float edgeIdLocal = OffsetToEdgeSegmentHead(link, tailLink);
+	float edgeLoopHeadId = EdgeId - edgeIdLocal;
+
+	float edgeLoopLen = tailLink.linkVal;
+
+	// Stroke-Segment Topology
+	float segRank, segLength;
+	CBuffer_PixelEdgeData_EdgeParam_LoadAll(
+		CBuffer_BufferRawPixelEdgeData,
+		EDGE_PARAM_STROKE,
+		EdgeId,
+		// out -----------
+		segRank, segLength
+	);
+
+	// Stroke Topo Analysis --------------------------------
+	// 
+	// Try to re-connect multiple broken strokes,
+	// which is possibly linked as one stroke in prev frame
+	// -----------------------------------------------------
+	uint edgeLoopLenU32 = (uint)(edgeLoopLen + .1f);
+
+	uint prevSegTailId = (uint)(edgeLoopHeadId + .1f) +
+		(uint)(edgeIdLocal - segRank - 1.0f + edgeLoopLen + .1f) % edgeLoopLenU32;
+
+	uint nextSegHeadId = (uint)(edgeLoopHeadId + .1f) +
+		(uint)(edgeIdLocal + segLength - segRank + edgeLoopLen + .1f) % edgeLoopLenU32;
+
+	uint prevSegLen = CBuffer_PixelEdgeData_EdgeParam_LoadSegLength(
+		CBuffer_BufferRawPixelEdgeData,
+		EDGE_PARAM_STROKE, // TODO: 
+		prevSegTailId
+	);
+	uint nextSegLen = CBuffer_PixelEdgeData_EdgeParam_LoadSegLength(
+		CBuffer_BufferRawPixelEdgeData,
+		EDGE_PARAM_STROKE, // TODO: 
+		nextSegHeadId
+	);
+
+
+	bool quickRecover = (!drawThisSeg)
+		&& (
+			(segLength < _MaxSmallSegLen) && 
+			(_MinLargeSegLen < min(prevSegLen, nextSegLen))
+		);
+	bool draw = (drawThisSeg || quickRecover);
+
+	SetEdgeAttrib( // Set as no-draw
+		draw, BIT_BEG_DRAW_FLAG, BIT_LEN_DRAW_FLAG,
+		edgeAttribsRaw
+	);
+
+	if (EdgeId < EdgeCount)
+	{
+		uint subbuffID_segKeyInput = 0;
+		if (id.x == 0)
+		{
+			CBuffer_SubBuff_StrokeSegmentKey = subbuffID_segKeyInput;
+		}
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_SegmentKey_AddrAt(
+				subbuffID_segKeyInput, EdgeId
+			),
+			draw ? 1 : STROKE_SEG_KEY_CULLED
+		);
+	}
+
+
+#ifdef DEBUG_REMERGE_SEGS
+	EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribsRaw);
+	float2 stampCoord = (float2)
+		DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+			CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo)));
+	float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+	if (EdgeId < EdgeCount)
+	{
+		float4 dbgCol = draw ?
+			COL_G : COL_B;
+		if ((uint)_DebugTextureIndex == 1)
+		{
+			_DebugTexture1[edgeCoord] = dbgCol;
+		}
+	}
+#endif
+}
+
+
+
+
+/////////////////////////////////////////////////////////////
+// Snippet for Analysing Stamp Topology from Edge-Loop Info
+/////////////////////////////////////////////////////////////
+	// 
+	// const uint StampCount = CBuffer_CachedArgs_PixelCounter;
+	// -------------------------------------------------------------------------------------
+	// Gather edge attributes
+	// // -------------------------------------------------------------------------------------
+	// uint4 stampToEdges = CBuffer_BufferRawPixelEdgeData.Load4(
+	// 	CBuffer_PixelEdgeData_StampToEdges_AddrAt(StampId, 0)
+	// );
+	// float edgePtrs[4] = {stampToEdges.x, stampToEdges.y, stampToEdges.z, stampToEdges.w};
+	// uint edgeCode = 0;
+	// uint i;
+	//
+	// // --------------------------------------------------------------
+	// // Record edge code
+	// // --------------------------------------------------------------
+	// bool hasDeletedEdge = false;
+	// [unroll]
+	// for (i = 0; i < 4; ++i)
+	// {
+	// 	bool deleteFlag = (GetEdgeDeleteFlag((uint)edgePtrs[i]) == 1);
+	// 	bool validEdge = (((uint)edgePtrs[i]) != INVALID_STAMP_EDGE);
+	// 	edgeCode |= (
+	// 		( // Exist such an edge && edge not deleted
+	// 			validEdge && (deleteFlag == false)
+	// 		) << i
+	// 	);
+	// 	hasDeletedEdge = hasDeletedEdge || (validEdge && deleteFlag);
+	// }
+	// uint edgeCount = countbits(edgeCode);
+//
+// 	// Fetch head & tail edge ids for 1st edge in stamp.
+// 	uint firstEdgeId = edgePtrs[firstbitlow(edgeCode)];
+// 	SerializedEdgeLinkage linkage = DecodeSerializedEdgeLinkage(
+// 		CBuffer_BufferRawStampLinkage.Load(
+// 			CBuffer_BufferRawEdgeSerializedLinkage_AddrAt(
+// 				firstEdgeId)
+// 		)
+// 	);
+// 	SerializedEdgeLinkage linkageTail = DecodeSerializedEdgeLinkage(
+// 		CBuffer_BufferRawStampLinkage.Load(
+// 			CBuffer_BufferRawEdgeSerializedLinkage_AddrAt(
+// 				firstEdgeId + OffsetToEdgeSegmentTail(linkage))
+// 		)
+// 	);
+// 	uint edgeLoopLen = linkageTail.linkVal;
+// 	uint edgeRank = linkage.tailFlag == 1 ? 0 : linkage.linkVal;
+// 	uint headEdgeId = firstEdgeId - (edgeLoopLen - edgeRank - 1);
+// 	uint tailEdgeId = headEdgeId + edgeLoopLen - 1;
+// #define IN_SAME_EDGE_LOOP(edgeId) (headEdgeId <= edgeId && edgeId <= tailEdgeId)
+//
+// 	// ---------------------------------------------------------------------
+// 	// Detect Degenerate Stamp
+// 	// ---------------------------------------------------------------------
+// 	uint edgeCodeCpy = edgeCode;
+// 	bool singleLoop = true;
+// 	// Step 1. Test if all edges are in the same edge loop
+// 	while (edgeCodeCpy != 0)
+// 	{
+// 		uint edge = firstbitlow(edgeCodeCpy);
+// 		// singleLoop = {singleLoop} and {current and #1st edge are at the same edge-loop}
+// 		singleLoop = singleLoop && IN_SAME_EDGE_LOOP((uint)edgePtrs[edge]);
+// 		edgeCodeCpy &= (~(1 << edge)); // clear bit
+// 	}
+// 	// Step 2. If 1. is true && #edges >= 2,
+// 	// see if the edges are linked contiguously
+// 	[branch]
+// 	if (singleLoop && edgeCount > 1)
+// 	{
+// 		// Step 2.1 Sort edges by edge id
+// 		float4 sorted = float4(
+// 			(edgeCode & 1) == 1 ? edgePtrs[0] : 10000000,
+// 			((edgeCode >> 1) & 1) == 1 ? edgePtrs[1] : 10000000,
+// 			((edgeCode >> 2) & 1) == 1 ? edgePtrs[2] : 10000000,
+// 			((edgeCode >> 3) & 1) == 1 ? edgePtrs[3] : 10000000
+// 		);
+// 		sorted = float4(
+// 			min(sorted.xy, sorted.zw),
+// 			max(sorted.xy, sorted.zw)
+// 		);
+// 		sorted.xy = sorted.x < sorted.y ? sorted.xy : sorted.yx;
+// 		sorted.zw = sorted.z < sorted.w ? sorted.zw : sorted.wz;
+//
+// 		// Step 2.2 Analysis of continuous edges
+// 		// -----------------------------------------------------------------
+// 		// in general, interval between SORTED edge ids have
+// 		// only 2 possibilities:
+// 		// |.......... E0 E1 E2 E3 .........| 1) Ek+1 - Ek == 1
+// 		// |E0 E1 .................... E2 E3| 2) E2 - E1 == len - #edges + 1
+// 		// |<------------ Len ------------->|
+// 		edgePtrs[0] = sorted.x;
+// 		edgePtrs[1] = sorted.y;
+// 		edgePtrs[2] = sorted.z;
+// 		edgePtrs[3] = sorted.w;
+// 		float interval;
+// 		bool jumped = false;
+// 		for (i = 0; i < edgeCount - 1; ++i)
+// 		{
+// 			interval = edgePtrs[i + 1] - edgePtrs[i];
+// 			bool cond2 = (edgeLoopLen - edgeCount + 1 == (uint)interval); // 2)
+// 			singleLoop = singleLoop && (
+// 				(1 == interval) || // 1)
+// 				(cond2 && (!jumped)) // 2), which only happens once
+// 			);
+// 			jumped = jumped || cond2;
+// 		}
+// 	}

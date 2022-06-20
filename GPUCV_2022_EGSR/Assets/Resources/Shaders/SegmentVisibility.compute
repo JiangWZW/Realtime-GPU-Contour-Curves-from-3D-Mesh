@@ -1,0 +1,332 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel SegmentVisibility_DepthTest
+
+#pragma use_dxc
+
+#include "../ShaderLibrary/ComputeKernelConfigs/SegmentVisibilityComputeDefs.hlsl"
+ 
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+
+globallycoherent RWTexture2D<uint> _PerPixelSpinLockTex;
+
+// Depth texture with y coord flipped
+Texture2D<float4> _CameraDepthTexture;
+RWTexture2D<float4> _DebugTexture;
+
+ByteAddressBuffer CBuffer_BufferRawRasterDataPerContour;
+ByteAddressBuffer CBuffer_BufferRawSegmentsToContour;
+ByteAddressBuffer CBuffer_BufferRawContourToSegment;
+
+RWByteAddressBuffer CBuffer_BufferRawFlagsPerSegment;
+RWByteAddressBuffer CBuffer_BufferRawRasterDataPerSeg;
+RWByteAddressBuffer CBuffer_BufferRawStampPixels;
+RWByteAddressBuffer CBuffer_BufferRawVisibleSegToSeg;
+
+groupshared uint LDS_NumGroupsNextDispatch;
+groupshared uint LDS_NumGroupsThisDispatch;
+
+
+// #define TEST_ACC_LOCKS
+// ----------------------------------------------------------------------------------
+uint TryRegisterSplatStampFragments(
+    bool centerVisible, bool isCanvasSegment,
+    int2 centerCoord)
+{
+	// -------------------------------------------------
+	// We use per-pixel lock texture to eliminate
+	// multiple fragment(segment)s in the same pixel.
+	// The segment survived in a pixel is randomly picked,
+	// as long as it get the 1st access to lock in L2 cache.
+	//
+	// Some fancier hashing scheme might be helpful?
+	// but this just works, for now...
+	int lock = 1;
+    if (centerVisible)
+    {
+        // Branch hurts performance,
+        // but this is needed, 'cause
+        // invisible pixels have a low chance
+        // to steal locks from visible ones,
+        // which will cause blinking artifact
+        InterlockedOr(
+            _PerPixelSpinLockTex[centerCoord],
+            1, lock
+        );
+    }
+    DeviceMemoryBarrierWithGroupSync();
+
+    uint neighLocks = (lock == 0);  // ____ ____ ___0
+	[unroll]
+	for (uint i = 1; i <= STAMP_SPLAT_COUNT; ++i)
+	{
+        neighLocks <<= 1;           // _ ____ __0_   // _ ____ _01_
+									// 0 1234 567_   
+        int2 lockCoord =
+            min((int2)_ScreenParams.xy, 
+                max(int2(0, 0), 
+                    centerCoord + splatOffset[i]
+                )
+            );
+        lock = 1;
+        if (centerVisible && (!isCanvasSegment))
+        {
+            InterlockedOr(
+                _PerPixelSpinLockTex[lockCoord],
+                1, lock
+            );
+        }
+
+        neighLocks = (neighLocks | (lock == 0));
+        //                         // _ ____ __01    // _ ____ _012
+        //                         // 0 1234 5678
+	}
+
+	
+    return neighLocks;
+}
+
+
+void SpawnSplatStampFragment(
+    inout uint pixelIndex, int2 pixelCoord, uint splatIndex
+){
+    pixelCoord = min((int2)_ScreenParams.xy, max(int2(0, 0), pixelCoord));
+    CBuffer_BufferRawStampPixels.Store(
+        CBuffer_BufferRawStampPixels_AddrAt(pixelIndex),
+        GetEncodedPixelCoordWithFlags(
+            PackPixelCoord((uint2)pixelCoord)
+        )
+    );
+    pixelIndex += 1;
+}
+
+
+// For details about canvas line implementation,
+// see notes at "ContourSetupComputeDefs.compute"
+#define RENDER_CANVAS
+
+float4 CVector_ScreenTexelSize_SS;
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void SegmentVisibility_DepthTest(
+    uint3 id : SV_DispatchThreadID,
+    uint3 gIdx : SV_GroupId,
+    uint groupIdx : SV_GroupIndex)
+{
+    const uint ContourCount = CBuffer_CachedArgs_ContourCounter + 4;
+	const uint SegmentCount = CBuffer_CachedArgs_SegmentCounter;
+    const uint SegmentID = id.x;
+    bool isValidThread = SegmentID < SegmentCount;
+
+	if (groupIdx == 0)
+	{
+        LDS_PrevBlockSum = 0;
+        LDS_PrevBlockSum1 = 0;
+	}
+    GroupMemoryBarrierWithGroupSync();
+	
+    // Load Global Buffers & Cache LDS buffers
+    ///////////////////////////////////////////////////////////////////////////////////
+    // Load Index of Current Contour
+    // ------------------------------------------------------------------------------
+    uint ldAddr = CBuffer_BufferRawSegmentsToContour_AddrAt(SegmentID);
+    const uint ContourId = CBuffer_BufferRawSegmentsToContour.Load(ldAddr);
+	
+    ldAddr = CBuffer_BufferRawContourToSegment_AddrAt(ContourId);
+    uint headSegIdx = CBuffer_BufferRawContourToSegment.Load(ldAddr);
+
+    // Load Per-Contour Raster Data
+    // --------------------------------------------------------------------------
+    uint4x2 rasterData = uint4x2(0, 0, 0, 0, 0, 0, 0, 0);
+    ldAddr = CBuffer_BufferRawRasterDataPerContour_AddrAt(ContourId);
+    // Load per-contour raster data computed in prev kernel
+    rasterData._11_21_31_41 = CBuffer_BufferRawRasterDataPerContour.Load4(ldAddr);
+    ldAddr = MoveAddrSingleBlock(ldAddr);
+    rasterData._12_22_32_42 = CBuffer_BufferRawRasterDataPerContour.Load4(ldAddr);
+
+
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // Compute Visibility
+    ////////////////////////////////////////////////////////////////////////////////
+    // Shared Memory has Broad-Casting access, which might be fast
+    uint4 begEndData = RASTER_DATA_BEG_END(rasterData);
+    float4 begEndFrags =
+#ifdef STAMP_MULTI_SAMPLE 
+		(((float)_StampMS) * CVector_ScreenTexelSize_SS.xyxy) *
+#else
+		(CVector_ScreenTexelSize_SS.xyxy) *
+#endif
+        // points sorted increasingly, along major axis
+        float4(
+            UnpackR16G16(begEndData.x).xy,
+            UnpackR16G16(begEndData.y).xy
+        );
+
+
+    float2 normal = asfloat(begEndData.zw);
+    float2 tangent = begEndFrags.zw - begEndFrags.xy;
+    tangent = IS_EDGE_CLOCKWISE(rasterData) ? tangent.xy : (-1 * tangent.xy);
+
+    // Note: contour direction in SS is DIFFERENT to that in NDC,
+    // because of non-squared resolution
+    // tangent *= _ScreenParams.xy; // NDC direction -- inaccurate
+    tangent = normalize(tangent);
+    tangent.y *= -1; // flip in y axis
+
+    // -----------------------------------------------------------------
+    // Estimate depth value
+    // -----------------------------------------------------------------
+	float linearInterp = 0;
+    float linearStep = 0; // how much "factor" costs to go to neighbor frag on edge
+	float2 sampleTexel = ComputeFragmentPosSS(
+        begEndFrags,
+        headSegIdx,
+        SegmentID,
+        IS_X_MAJOR_EDGE(rasterData),
+        linearInterp, // out =>
+        linearStep // out =>
+    );
+
+
+
+	
+    // Texture2D.Load uses screen space coord;
+    // Ranges within [0, TextureWidth - 1] X [0, TextureHeight - 1]
+#ifdef STAMP_MULTI_SAMPLE
+    // Flip y when dealing with RT, fuck you, unity.
+    sampleTexel.y = ((float)_StampMS) * _ScreenParams.y - sampleTexel.y;
+    int2 loadAddr = int2(floor((sampleTexel) * _RCP_StampMS));
+#else
+    int2 loadAddr = int2(floor(sampleTexel));
+#endif
+
+
+	// Compute Segment Depth
+	// ------------------------------------------
+    double2 w0w1 = GET_RASTER_DATA_HCLIP_W(rasterData);
+    float segmentEyeDepth = InterpolateEyeDepth(
+        w0w1, // -z0, -z1 (z0, z1 := view-space-depth)
+        linearInterp
+    );
+    // (1/z_view) variation along major axis, per pixel
+
+    // ------------------------------------------------------
+    // Depth Sampling
+    // ------------------------------------------------------
+    // Custom Depth Texture is up-sampled to a certain scale, uniformly
+    float screenToZRes = 1.0; // _CustomDepthTextureScale;
+    const float2 depthTexelLen = (_ScreenParams.zw - 1) / screenToZRes;
+
+	// Start sampling 3x3 neighbors
+    float3x3 depthSampleBox =
+        DepthLoad3x3Box(
+            loadAddr,
+            depthTexelLen
+        );
+	
+    const float2 dzdxy = ComputeSSDzDxy(depthSampleBox);
+    float depthGrad = sqrt(dot(dzdxy, dzdxy));
+
+    bool visible = isValidThread &&
+        (DepthTest(depthSampleBox, 0.02, segmentEyeDepth) > 1);
+
+	
+#ifdef RENDER_CANVAS
+    bool isCanvasSegment = 
+        (ContourCount - 4 <= ContourId && ContourId < ContourCount);
+	visible = isCanvasSegment || visible;
+    isValidThread = isCanvasSegment || isValidThread;
+#endif
+
+
+    uint2 pixelCoord =
+#ifdef STAMP_MULTI_SAMPLE
+		(uint2)(sampleTexel.xy) / _StampMS;
+#endif
+    // SplatMode    Square       Star
+    // #bits:    8 7654 3210    4 3210
+    // splat id: 0 1234 5678    0 1234
+    uint pixelGenCode = TryRegisterSplatStampFragments(
+        visible, isCanvasSegment, loadAddr
+    );
+	
+    uint isPixelSeg = (1u == (pixelGenCode >> STAMP_SPLAT_COUNT));
+    // Should pixel which current segment is at to be generated
+	// If neighbor pixels should be generated
+    // Total #pixels to generate
+    uint numPixels = countbits(pixelGenCode);
+     
+	uint pixelIndex = StreamCompaction_PixelGen(groupIdx, numPixels);
+	[unroll]
+	for (uint i = 0; i <= STAMP_SPLAT_COUNT; ++i)
+	{
+        if (1 == (1 & pixelGenCode))
+        {
+            uint splatIndex = STAMP_SPLAT_COUNT - i;
+            SpawnSplatStampFragment(
+                pixelIndex, // inout, add by 1
+                (int2)pixelCoord + splatOffset[splatIndex],
+                splatIndex
+            );
+        }
+        pixelGenCode >>= 1;
+	}
+
+
+	
+    bool isVisibleSeg = visible && isValidThread;
+    uint visibleSegIndex = StreamCompaction_VisibleSegGen(
+        groupIdx, isVisibleSeg
+    );
+
+    // if (isValidThread && !isCanvasSegment)
+    // {
+    //     _DebugTexture[pixelCoord] = depthGrad;
+    // }
+   
+    // ---------------------------------------------------------------------
+    // Pack & Validate & Store --- Output Data
+    // ---------------------------------------------------------------------
+    // --- Per-Segment Flag
+    // Note: several flags are not used now, consider replacing
+    if (isVisibleSeg/*isValidThread*/)
+    {
+        uint strData = EncodeSegmentFlag(
+            // Segment coordinate packed into 30 bits.
+            // Note that this is not the "coordinate" of stamp,
+            // but the high-res texel position.
+            EncodeSegCoordFromSegPosition(sampleTexel),
+            isPixelSeg, // If this segment is lucky enough to represent a stamp pixel
+            visible, // Flag: is segment visible
+            0
+        );
+        uint strAddr = visibleSegIndex/*SegmentID*/ << 2;
+        CBuffer_BufferRawFlagsPerSegment.Store(strAddr, strData);
+
+
+        // --- Per Segment Raster Data
+        ContourSegRasterData segRasterData;
+        // Zview = ZEye * -1.0; (camera points to -z direction in view space)
+        segRasterData.viewZ             = -1.0 * segmentEyeDepth;
+        segRasterData.normal =
+            normal;                             // from vertex normal
+            // float2(tangent.y, -tangent.x);   // from edge direction
+        segRasterData.depthGrad         = depthGrad;
+        segRasterData.visibleSegIndex   = visibleSegIndex;
+
+        CBuffer_BufferRawRasterDataPerSeg.Store4(
+            CBuffer_BufferRawRasterDataPerVisibleSeg(0, visibleSegIndex),
+            segRasterData.Encode()
+        );
+
+    	
+        // Stamp pixels need to access contour geometry
+    	// in later temporal reprojection
+        CBuffer_BufferRawRasterDataPerSeg.Store2(
+            CBuffer_BufferRawVisibleSegToContour(visibleSegIndex),
+            uint2(asuint(linearInterp), ContourId)
+        );
+    }
+}
+
+

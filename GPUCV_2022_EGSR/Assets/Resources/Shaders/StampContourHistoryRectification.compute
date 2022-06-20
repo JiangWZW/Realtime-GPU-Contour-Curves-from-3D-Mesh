@@ -1,0 +1,68 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel StampContourHistoryRectification_SelectAmbiguousHistory
+
+// #pragma use_dxc
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourHistoryRectificationComputeDefs.hlsl"
+
+// #define DEBUG_HISTORY_RECTIFIER
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgs;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgs1;
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+ByteAddressBuffer CBuffer_BufferRawProceduralGeometry;
+ByteAddressBuffer CBuffer_BufferRawFlagsPerStamp;
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawStampLinkage;
+RWByteAddressBuffer CBuffer_BufferRawRasterDataPerSeg;
+RWByteAddressBuffer CBuffer_BufferRawLookBacks;
+
+
+void LoadHistorySamplePointers(
+	uint ldAddr,
+	out uint2 histEdgePtrs
+){
+	histEdgePtrs = CBuffer_BufferRawStampGBuffer.Load2(ldAddr);
+}
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourHistoryRectification_SelectAmbiguousHistory(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID
+)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+#define EdgeId ((min(EdgeCount, id.x)))
+
+	// Load Edge Attribs
+	uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+	);
+	EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+
+	// Load Stamp Coord
+	uint stampCoordPacked = CBuffer_BufferRawStampPixels.Load(
+		CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo));
+
+
+	// Load sample pointer(s)(encoded with flag-bits)
+	uint2 histEdgePtrs = 0;
+	// LoadHistorySamplePointers(
+	// 	CBuffer_StampRPJSampleID_AddrAt(
+	// 		edgeAttribsMain.stampInfo
+	// 	),
+	// 	histEdgePtrs
+	// );
+
+	
+}

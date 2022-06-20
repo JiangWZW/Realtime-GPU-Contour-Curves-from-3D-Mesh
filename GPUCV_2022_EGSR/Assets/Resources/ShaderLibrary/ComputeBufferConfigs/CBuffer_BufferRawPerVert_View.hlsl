@@ -1,0 +1,16 @@
+#ifndef CBUFFER_BUFFERRAWPERVERT_VIEW_INCLUDED
+#define CBUFFER_BUFFERRAWPERVERT_VIEW_INCLUDED
+
+#include "../ComputeAddressingDefs.hlsl"
+
+#define BITS_VERT_POS_STRIDE_OFFSET BITS_BLOCK_OFFSET
+#define VP_BUFFER (0)
+#define VP_STRIDE (1 << BITS_VERT_POS_STRIDE_OFFSET)
+#define VP_BUFFER_LENGTH(numVerts) (numVerts * VP_STRIDE)
+uint CBuffer_BufferRawPerVert_VP_AddrAt(uint vertId)
+{
+	return vertId << BITS_VERT_POS_STRIDE_OFFSET;
+}
+
+
+#endif /* CBUFFER_BUFFERRAWPERFACE_VIEW_INCLUDED */

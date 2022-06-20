@@ -1,0 +1,199 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel StampContourLinkingOptimized_CircularPathRanking_Reduction
+#pragma kernel StampContourLinkingOptimized_CircularPathRanking_ResetDispatchArgs
+#pragma kernel StampContourLinkingOptimized_CircularPathRanking_After
+
+#define TRACING_KERNELS
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourTracingComputeDefs.hlsl"
+
+
+
+#pragma use_dxc
+int _Iteration;
+RWStructuredBuffer<uint> CBuffer_StructuredTempBuffer;
+groupshared uint LDS_PrevBlockSum = 0;
+// =======================================================
+#define SCAN_FUNCTION_TAG ListRankingCull
+
+uint op0(uint a, uint b)
+{
+	return a + b;
+}
+
+#define OP op0
+#define SCAN_DATA_TYPE uint
+#define SCAN_SCALAR_TYPE uint
+#define SCAN_ZERO_VALUE 0u
+// #define SCAN_DATA_VECTOR_STRIDE 2
+#define SCAN_BLOCK_SIZE GROUP_SIZE_0
+
+#define TG_COUNTER CBuffer_StructuredTempBuffer[_Iteration + 1]
+#define TGSM_COUNTER LDS_PrevBlockSum
+
+#include "../ShaderLibrary/StreamCompactionCodeGen.hlsl"
+// =======================================================
+
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawStampLinkage;
+RWStructuredBuffer<uint> CBuffer_DispatchIndirectArgsEdgeRankingOPT;
+
+
+uint LoadEdgeIdFromIndirectionTable(uint indirectionId, uint subIteration)
+{
+	return CBuffer_BufferRawStampLinkage.Load(
+		CBuffer_BufferRawEdgeIndirect_AddrAt(
+			subIteration,
+			indirectionId)
+	);
+}
+
+void StoreEdgeIdToIndirectionTable(uint tableId, uint edgeId, uint subIteration)
+{
+	CBuffer_BufferRawStampLinkage.Store(
+		CBuffer_BufferRawEdgeIndirect_AddrAt(
+			(subIteration + 1) % 2,
+			tableId),
+		edgeId
+	);
+}
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourLinkingOptimized_CircularPathRanking_Reduction(
+	uint groupId : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID,
+	uint3 id : SV_DispatchThreadID)
+{
+	if (groupId == 0u)
+	{
+		LDS_PrevBlockSum = 0;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	
+	// TODO: not needed in later passes
+	uint subIteration = ((uint)_Iteration) % 2;
+	// CBuffer_StructuredTempBuffer[0] == EdgeCount
+	// CBuffer_StructuredTempBuffer[1] == Filtered EdgeCount
+	const uint ActiveEdgeCount = CBuffer_StructuredTempBuffer[_Iteration];
+	const uint TotalEdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+	// Initially: IndirectionTable[edgeId] == edgeId
+	uint edgeId = LoadEdgeIdFromIndirectionTable(id.x, subIteration);
+	bool isRedundant = id.x >= ActiveEdgeCount;
+
+	EdgeLinkRT resA = EdgePointerJumping_Dbg(
+		edgeId, TotalEdgeCount,
+		subIteration, CBuffer_BufferRawStampLinkage,
+		isRedundant // inout
+	);
+	// -----------------------------------------------------------------------
+
+	uint scanData = (!isRedundant);
+	uint culledEdgeId = StreamCompaction_ListRankingCull(
+		groupId, scanData
+	);
+
+	// ------------------------------------------------------------------------
+	if (scanData == 1u)
+	{
+		StoreEdgeIdToIndirectionTable(culledEdgeId, edgeId, subIteration);
+	}
+#ifdef DEBUG_EDGE_RANKING
+	uint edgeData, stampId;
+	float2 stampCoord, adjStampCoord;
+	// --------------------------------------------------------------------------------------------------
+#define DEBUG_MAXID_JUMPING_FUNC(isRedundant, scanDatai, res, EdgeId)														\
+	edgeData = CBuffer_BufferRawPixelEdgeData.Load(														\
+		CBuffer_PixelEdgeData_EdgesToStamp_AddrAt(EdgeId)												\
+	);																									\
+	stampId = GET_STAMP_EDGE_STAMP_ID(edgeData);														\
+	stampCoord =																						\
+		(float2)DecodePixelCoord(																		\
+			CBuffer_BufferRawStampPixels.Load(															\
+				CBuffer_BufferRawStampPixels_AddrAt(stampId)));											\
+	adjStampCoord = stampCoord + MoveAtOppositeStamp(GET_STAMP_EDGE_DIR_CURR(edgeData));				\
+	if ((EdgeId < TotalEdgeCount))																					\
+	{																									\
+		_DebugTexture[adjStampCoord] = /* float4( */									\
+			/* RandColRgb(res.nextEdgeID, res.nextEdgeID * res.nextEdgeID), 1);	*/		\
+			scanDatai == 1 ? float4(1, 0, 0, 1) : float4(0, 0, 1, 1);\
+	}																									\
+	// --------------------------------------------------------------------------------------------------
+
+	// DEBUG_MAXID_JUMPING_FUNC(isRedundantA, scanDataAB.x, resA, edgeIds.x)
+
+	// DEBUG_MAXID_JUMPING_FUNC(isRedundantB, scanDataAB.y, resB, edgeIds.y)
+
+#endif
+}
+
+#define NUM_REDUCTION_PASSES 1
+
+[numthreads(1, 1, 1)]
+void StampContourLinkingOptimized_CircularPathRanking_ResetDispatchArgs(
+	uint3 id : SV_DispatchThreadID)
+{
+	uint reducedEdgeCount = CBuffer_StructuredTempBuffer[NUM_REDUCTION_PASSES];
+	CBuffer_DispatchIndirectArgsEdgeRankingOPT[0] = 
+		ComputeNumGroups(reducedEdgeCount, GROUP_SIZE_0, BITS_GROUP_SIZE_0);
+}
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourLinkingOptimized_CircularPathRanking_After(
+	uint groupId : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID,
+	uint3 id : SV_DispatchThreadID)
+{
+	// TODO: not needed in later passes
+	uint subIteration = ((uint)_Iteration) % 2;
+	const uint ActiveEdgeCount = CBuffer_StructuredTempBuffer[NUM_REDUCTION_PASSES];
+	const uint TotalEdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+
+	uint EdgeId = id.x;
+	bool isRedundant = EdgeId >= ActiveEdgeCount;
+	EdgeId = LoadEdgeIdFromIndirectionTable(EdgeId, NUM_REDUCTION_PASSES % 2);
+
+	EdgeLinkRT res = EdgePointerJumping_Dbg(
+		EdgeId, TotalEdgeCount,
+		subIteration, CBuffer_BufferRawStampLinkage,
+		isRedundant // inout
+	);
+
+#ifdef DEBUG_EDGE_RANKING
+	uint edgeData, stampId;
+	float2 stampCoord, adjStampCoord;
+	// --------------------------------------------------------------------------------------------------
+#ifdef DEBUG_MAXID_JUMPING_FUNC
+#undef DEBUG_MAXID_JUMPING_FUNC
+#endif
+#define DEBUG_MAXID_JUMPING_FUNC(isRedundant, res, EdgeId)														\
+	edgeData = CBuffer_BufferRawPixelEdgeData.Load(														\
+		CBuffer_PixelEdgeData_EdgesToStamp_AddrAt(EdgeId)												\
+	);																									\
+	stampId = GET_STAMP_EDGE_STAMP_ID(edgeData);														\
+	stampCoord =																						\
+		(float2)DecodePixelCoord(																		\
+			CBuffer_BufferRawStampPixels.Load(															\
+				CBuffer_BufferRawStampPixels_AddrAt(stampId)));											\
+	adjStampCoord = stampCoord + MoveAtOppositeStamp(GET_STAMP_EDGE_DIR_CURR(edgeData));				\
+	if ((EdgeId < TotalEdgeCount))																					\
+	{																									\
+		_DebugTexture[adjStampCoord] = float4(											\
+			RandColRgb(res.nextEdgeID, res.nextEdgeID * res.nextEdgeID), 1);			\
+	}																									\
+	// --------------------------------------------------------------------------------------------------
+
+	DEBUG_MAXID_JUMPING_FUNC(isRedundantA, res, EdgeId)
+
+#endif
+}

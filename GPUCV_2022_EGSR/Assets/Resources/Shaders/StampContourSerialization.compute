@@ -1,0 +1,316 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel StampContourSerialization_GetListLength
+#pragma kernel StampContourSerialization_BuildEdgeLists
+
+#define SERIALIZATION_KERNELS
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourTracingComputeDefs.hlsl"
+
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgsPerEdgeLoop;
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+RWByteAddressBuffer CBuffer_BufferRawEdgeLoopData;
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawStampLinkage;
+RWByteAddressBuffer CBuffer_BufferRawRasterDataPerSeg; // Used as scan buffer
+#define SCAN_BUFFER CBuffer_BufferRawRasterDataPerSeg
+RWStructuredBuffer<uint> CBuffer_StructuredTempBuffer1;
+
+
+RWByteAddressBuffer CBuffer_BufferRawLookBacks;
+
+#define EdgeId (id.x)
+// #define DEBUG_SMOOTHED_COORD
+
+uint2 PackTempEdgeLoopInfo(
+	uint edgeLoopIdentifier, 
+	uint edgeLoopListAddr, uint edgeLoopListSize)
+{
+	uint2 packed = uint2(edgeLoopListAddr, edgeLoopListSize);
+	packed &= 0x00ffffff;
+	packed.x |= (edgeLoopIdentifier << 24); // low 8 bits
+	packed.y |= ((edgeLoopIdentifier >> 8) << 24); // high 8 bits
+
+	return packed;
+}
+
+void UnpackTempEdgeLoopInfo(
+	uint2 packed, 
+	out uint edgeLoopIdentifier, 
+	out uint edgeLoopListAddr, out uint edgeLoopListSize)
+{
+	edgeLoopListAddr = packed.x & 0x00ffffff;
+	edgeLoopListSize = packed.y & 0x00ffffff;
+
+	edgeLoopIdentifier = (packed.y >> 24); // high 8 bits
+	edgeLoopIdentifier <<= 8;
+	edgeLoopIdentifier |= (packed.x >> 24); // low 8 bits
+}
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourSerialization_GetListLength(
+	uint3 id : SV_DispatchThreadID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+	// Step 1 ----------------------------------
+	// Load & Decode ranking results to get
+	// rank & seed flag
+	// See notes at StampContourLinking.compute
+	uint edgeLoopListSize;
+	bool isSeed;
+	EdgeLinkRT linkRT = ExtractEdgeLinkRT(
+		CBuffer_BufferRawStampLinkage.Load2(
+			CBuffer_BufferRawEdgeLinkage_AddrAt(
+				PINGPONG_STAMP_LINKAGE_0,
+				EdgeId
+			)
+		)
+	);
+	edgeLoopListSize = linkRT.rank;
+	isSeed = linkRT.isSeed;
+
+	
+	// Step 2 ------------------------------------------
+	// Accumulate list size to get list starting address
+	uint edgeLoopListAddr = 0;
+	uint edgeLoopIdentifier = 0;
+	if (isSeed && EdgeId < EdgeCount)
+	{
+		InterlockedAdd(
+			CBuffer_CachedArgs_ScanCounter(1),
+			edgeLoopListSize,
+			edgeLoopListAddr
+		);
+		InterlockedAdd(
+			CBuffer_EdgeLoopCounter,
+			1u, 
+			edgeLoopIdentifier 
+		);
+		InterlockedMax(CBuffer_StructuredTempBuffer1[10], edgeLoopListSize);
+	}
+
+	
+	// Step 3 ------------------------------------------
+	// Store list size & start addr in seed nodes' slots
+	if (isSeed && EdgeId < EdgeCount)
+	{
+		// Sub-linkage-buffer #1 is not needed now,
+		// so we re-use it to store edge-loop list info for seed-edges
+		CBuffer_BufferRawStampLinkage.Store2(
+			CBuffer_BufferRawEdgeLinkage_AddrAt(
+				PINGPONG_STAMP_LINKAGE_1, EdgeId),
+			// uint2(edgeLoopListAddr, edgeLoopListSize)
+			PackTempEdgeLoopInfo(
+				edgeLoopIdentifier, edgeLoopListAddr, edgeLoopListSize
+			)
+		);
+	}
+}
+
+// -------------------------------------------//
+// Note: When debugging serialization issues, //
+// pay special attention to canvas edges since//
+// they have separated generation-logic.	  //
+// -------------------------------------------//
+[numthreads(GROUP_SIZE_1, 1, 1)]
+void StampContourSerialization_BuildEdgeLists(
+	uint3 id : SV_DispatchThreadID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+	// Load linkage data to get seed edge id & rank
+	EdgeLinkRT linkDataRT = ExtractEdgeLinkRT(
+		CBuffer_BufferRawStampLinkage.Load2(
+			CBuffer_BufferRawEdgeLinkage_AddrAt(
+				PINGPONG_STAMP_LINKAGE_0, EdgeId))
+	);
+	
+	// Sub-linkage-buffer #1 is not needed now,
+	// so we re-use it to store edge-loop list info
+	// uint2(edgeLoopListAddr, edgeLoopListSize)
+	uint2 listInfo = CBuffer_BufferRawStampLinkage.Load2(
+		CBuffer_BufferRawEdgeLinkage_AddrAt(
+			PINGPONG_STAMP_LINKAGE_1,
+			linkDataRT.nextEdgeID // id of seed edge in loop,
+			// used as list header
+		)
+	);
+	uint edgeLoopIdentifier, edgeLoopListAddr, edgeLoopListSize;
+	UnpackTempEdgeLoopInfo(listInfo,
+		// out -----------------------------------------------
+		edgeLoopIdentifier, edgeLoopListAddr, edgeLoopListSize
+	);
+#define EDGE_SEG_ADDR (edgeLoopListAddr)
+#define EDGE_SEG_SIZE (edgeLoopListSize)
+
+	// Fetch stamp coord
+	EdgeToStampData edgeData =
+		DecodeEdgeToStampData(
+			CBuffer_BufferRawPixelEdgeData.Load(
+				CBuffer_PixelEdgeData_EdgesToStamp_AddrAt(EdgeId)
+			)
+		);
+	uint2 stampCoord = DecodePixelCoord(
+		CBuffer_BufferRawStampPixels.Load(
+			CBuffer_BufferRawStampPixels_AddrAt(edgeData.stampID)
+		)
+	);
+
+
+	//						Store Serialized Edge Data
+	//////////////////////////////////////////////////////////////////////////////
+	// Step 1 -----------------------------------------------------------
+	// Compute serialized edge index
+	// rank: 4	  3	   2	1
+	//		list_size - rank
+	// === s:0 -> 1 -> 2 -> 3 ===
+	uint serializedEdgeIndex =
+		EDGE_SEG_ADDR // list start addr
+		+ (EDGE_SEG_SIZE - linkDataRT.rank); // offset, list size - rank
+
+
+	// Step 2 --------------------------------------------------------------------
+	// Compute & store edge attributes
+	// rank: 4	  3	   2	1
+	// === s:0 -> 1 -> 2 -> 3 ===
+	// HF:   1    0    0	2
+	uint segTopoFlag = 0;							//					  0
+	segTopoFlag |= (linkDataRT.isSeed);				// isListHead ?	 01	  :	  00
+	segTopoFlag |= ((linkDataRT.rank == 1) << 1);	// isListTail ? 11:01 :  10:00
+
+
+
+	// Step 3 -----------------------------------------------------------------
+	// Serialized linkage
+	// rank: 4	  3	   2	1
+	// === s:0 -> 1 -> 2 -> 3 ===
+	// HF:   1    0    0    2
+	// link: 3	  2	   1    4
+	if (EdgeId < EdgeCount)
+	{
+		// Store edge's linkage inside edge-loop
+		CBuffer_BufferRawStampLinkage.Store(
+			CBuffer_BufferRawEdgeSerializedLinkage_AddrAt(serializedEdgeIndex),
+			// For details, see StampLinkageBufferView.hlsl
+			EncodeEdgeSerializedLinkage(
+				1 == (linkDataRT.rank), 
+				linkDataRT.rank,
+				EDGE_SEG_SIZE
+			)
+		);
+	}
+
+	// Init differential area for Despeckling Process
+	float ydx = ComputeDifferentialArea(
+		edgeData.currDir, 
+		(float)(stampCoord.y)
+	);
+
+
+	if (EdgeId < EdgeCount)
+	{
+		// Store edge attributes
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeCoord_Encoded_AddrAt(serializedEdgeIndex),
+			EncodePixelEdgeCoord(stampCoord, edgeData.currDir)
+		);
+
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, serializedEdgeIndex),
+			EncodeEdgeAttrib(
+				edgeData.stampID,
+				edgeData.currDir,
+				segTopoFlag
+			)
+		);
+
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_StampToEdges_AddrAt(edgeData.stampID, edgeData.currDir),
+			serializedEdgeIndex
+		);
+
+		// Prep for despeckling process,
+		// basically integrate ydx to obtain edge-loop area
+		SCAN_BUFFER.Store2(
+			CBuffer_PixelEdgeData_ScanWorkbench_AddrAt(serializedEdgeIndex),
+			EncodeDifferentialArea_HF_Coord(
+				linkDataRT.isSeed,
+				stampCoord, 
+				ydx
+			)
+		);
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(1, serializedEdgeIndex),
+			asuint(ydx)
+		);
+
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_EdgeLoopID_AddrAt(serializedEdgeIndex),
+			edgeLoopIdentifier
+		);
+
+		if (linkDataRT.isSeed)
+		{
+			uint loopLen = linkDataRT.rank;
+			
+			CBuffer_BufferRawEdgeLoopData.Store(
+				CBuffer_EdgeLoopData_HeadEdgeID_AddrAt(edgeLoopIdentifier), 
+				serializedEdgeIndex
+			);
+			CBuffer_BufferRawEdgeLoopData.Store(
+				CBuffer_EdgeLoopData_Length_AddrAt(edgeLoopIdentifier),
+				loopLen
+			);
+			CBuffer_BufferRawEdgeLoopData.Store(
+				CBuffer_EdgeLoopData_TailEdgeID_AddrAt(edgeLoopIdentifier),
+				serializedEdgeIndex + loopLen - 1
+			);
+		}
+		
+#ifdef DEBUG_SMOOTHED_COORD
+		float2 edgeCoord =
+			stampCoord +
+			MoveAtOppositeStamp(edgeData.currDir);
+		_DebugTexture1[edgeCoord] = float4(serializedEdgeIndex, 0, 0, linkDataRT.rank);
+#endif
+	}
+
+
+	////////////////////////////////////////////////////////////////////////////////////////
+	// Clean up scan table
+	uint numThreadsNext = (EdgeCount + 1)/* >> 1*/; // X2 edges each thread
+	uint numGroupsNext = ComputeNumGroups(numThreadsNext, GROUP_SIZE_NEXT, BITS_GROUP_NEXT);
+
+	uint numSlotsToClear = (numThreadsNext) - EdgeCount;
+	if (id.x < numSlotsToClear)
+	{
+		// Clear data slots
+		SCAN_BUFFER.Store(
+			CBuffer_PixelEdgeData_ScanWorkbench_AddrAt(EdgeCount + id.x),
+			0
+		);
+	}
+
+	if (id.x < numGroupsNext * 2)
+	{
+		// Clear reduce buffer
+		CBuffer_BufferRawLookBacks.Store(
+			id.x << BITS_WORD_OFFSET, 0
+		);
+	}
+
+	if (id.x == 0)
+	{
+		uint workSize = CBuffer_EdgeLoopCounter;
+		CBuffer_DispatchIndirectArgsPerEdgeLoop[0] =
+			ComputeNumGroups(workSize, GROUP_SIZE_0, BITS_GROUP_SIZE_0);
+	}
+}

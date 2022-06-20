@@ -1,0 +1,66 @@
+﻿#pragma kernel StampForwardProjection_SetDispatchArgs
+#pragma kernel StampForwardProjection_ForwardProjection
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StampForwardProjectionComputeDefs.hlsl"
+
+// #define DEBUG_FORWARD_PROJ
+
+Texture2D<float4> _CameraDepthTexture;
+RWByteAddressBuffer CBuffer_BufferRawProceduralGeometry;
+
+float4x4 CMatrix_HMVP;
+float4x4 CMatrix_I_HMVP;
+float4x4 CMatrix_I_MVP;
+float4x4 CMatrix_MVP;
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgs;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgs1;
+
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampForwardProjection_SetDispatchArgs(
+	uint3 id : SV_DispatchThreadID)
+{
+	uint EdgeCount = CBuffer_HistoryPixelEdgeCounter;
+	uint workSize = EdgeCount;
+	uint numGroups = ComputeNumGroups(workSize, 256, 8);
+	if (id.x == 0)
+	{
+		CBuffer_DispatchIndirectArgs1[0] = numGroups;
+	}
+}
+
+
+
+
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampForwardProjection_ForwardProjection(
+	uint3 id : SV_DispatchThreadID,
+	uint groupId : SV_GroupIndex,
+	uint3 gId : SV_GroupID)
+{
+	uint EdgeCount = CBuffer_HistoryPixelEdgeCounter;
+
+#define EdgeId (id.x)
+	// Load Edge Attribs
+	uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+	);
+	EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+	uint drawFlag = GetEdgeAttrib(
+		BIT_BEG_DRAW_FLAG, BIT_LEN_DRAW_FLAG,
+		edgeAttribs
+	);
+	
+}

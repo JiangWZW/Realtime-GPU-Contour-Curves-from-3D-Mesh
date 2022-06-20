@@ -1,0 +1,51 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ContourPixelExtraction_SegToPixel
+
+#include "../ShaderLibrary/ComputeKernelConfigs/ContourPixelExtractionComputeDefs.hlsl"
+
+RWStructuredBuffer<uint>    CBuffer_CachedArgs;
+RWStructuredBuffer<uint>    CBuffer_CachedArgs1;
+
+RWStructuredBuffer<int>     CBuffer_StampDrawIndirectArgs;
+RWStructuredBuffer<int>     CBuffer_FragmentDrawIndirectArgs;
+/////////////////////////////////////////////////////////////////
+// Setup for scan functions
+// Register scan
+uint4 ExclusiveScanLocal_X4(uint4 localData){
+   uint4 res = uint4(0, 0, 0, 0);
+   // Note: x always 0, so we store original w in x
+   // and we'll use that w value later
+   res.xyzw += localData.wxyz;
+   res.zw += localData.xy;
+   res.w += localData.x;
+
+   return res;
+}
+#define ORIGINAL_W_VAL(val) (val.x)
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void ContourPixelExtraction_SegToPixel (
+    uint3 id : SV_DispatchThreadID,
+    uint groupIdx : SV_GroupIndex,
+    uint3 gIdx : SV_GroupID)
+{
+    // ------------------------------------------------------------------
+    // Note: Actual pixel extraction logic has been moved to
+	// visibility kernel.
+    if (id.x == 0)
+    {
+        // Set Draw Indirect Args
+        // ---------------------------------------------------------
+        // Draw args have been forwarded to StampLinking Kernel
+        // (1-deprecated)5 point prim per seg
+        CBuffer_FragmentDrawIndirectArgs[0] = // CBuffer_CachedArgs_VisibleSegCounter;
+            CBuffer_CachedArgs_VisibleSegCounter
+    		* (1 + STAMP_SPLAT_COUNT); // 3x3 box(*9) or star(*5)
+        // Reset Cached Args
+        CBuffer_CachedArgs_NumGroups(0) = 0;
+        // Clear scan counters
+    	CBuffer_CachedArgs_ScanCounter(1) = 0;
+        CBuffer_CachedArgs_ScanCounter(0) = 0;
+    }
+}

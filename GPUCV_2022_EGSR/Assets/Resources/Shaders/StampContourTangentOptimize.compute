@@ -1,0 +1,131 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel StampContourTangentOptimize_Smooth
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourTangentOptimizeComputeDefs.hlsl"
+
+// #define DEBUG_SMOOTHED_COORD
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+ByteAddressBuffer CBuffer_BufferRawStampLinkage;
+
+#define FILTER_RADIUS 16
+
+void StoreGlobalConvData(uint edgeId, T_CONV convRes)
+{
+	PING_PONG_BUFFER.Store(
+		Conv_Buffer_ConvData_AddrAt((_PingPong + 1) % 2, edgeId),
+		PackUnitVector_2D(convRes)
+	);
+}
+
+static float TangentConvKernel[1 + FILTER_RADIUS] = {
+	// http://dev.theomader.com/gaussian-kernel-calculator/
+	// Sigma == , Kernel Size == 9
+	.079733, 0.078159, 0.073622, 0.066638, 0.05796, 0.048441, 0.038903, 0.030022, 0.022263,
+	0.015864, 0.010863, 0.007147, 0.004519, 0.002745, 0.001603, 0.000899, 0.000485
+	// 0.001924, 0.002957, 0.004419, 0.006424, 0.009084, 0.012493, 0.016713, 0.021747, 0.027524,
+	// 0.033882, 0.04057,	0.04725,  0.053526, 0.058978, 0.063209, 0.065892, 0.066812
+};
+
+
+void TangentConvolution(
+	uint d, CONV_DATA_T data,
+	inout T_CONV tangent)
+{
+	tangent += (TangentConvKernel[d] * data.xy);
+}
+
+
+
+#define EdgeId ((id.x))
+[numthreads(GROUP_SIZE_CONV, 1, 1)]
+void StampContourTangentOptimize_Smooth(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage, 
+		EdgeId
+	);
+
+	float2 convData;
+	SetupSegmentedConvolution_TangentFiltering(
+		gIdx, groupIdx, EdgeCount,
+		/*out*/convData
+	);
+
+	// Step 4. Apply actual convolution iterations
+	convData *= TangentConvKernel[0];
+
+	for (uint d = 1; d <= FILTER_RADIUS; ++d)
+	{
+		// TODO: median vector filtering
+		T_CONV dataNeigh;
+		dataNeigh = LoadLDSConvData_AtLeft_TangentFiltering(
+			d, gIdx.x, groupIdx,
+			edgeloop.length,
+			edgeloop.headEdgeId
+		);
+		TangentConvolution(d, dataNeigh, convData/*inout*/);
+		
+		dataNeigh = LoadLDSConvData_AtRight_TangentFiltering(
+			d, gIdx.x, groupIdx,
+			edgeloop.length,
+			edgeloop.headEdgeId
+		);
+		TangentConvolution(d, dataNeigh, convData/*inout*/);
+	}
+
+	convData = normalize(convData);
+
+
+	if (EdgeId < EdgeCount)
+	{
+		StoreGlobalConvData(EdgeId, convData);
+
+		if (_PingPong == 1)
+		{
+			CBuffer_BufferRawPixelEdgeData.Store(
+				CBuffer_PixelEdgeData_EdgeTangent_AddrAt(EdgeId),
+				PackUnitVector_2D(convData)
+			);
+		}
+
+
+#ifdef DEBUG_SMOOTHED_COORD
+		uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+		);
+		EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+
+		float2 stampCoord = (float2)
+			DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo)));
+
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+
+		_DebugTexture[(int2)edgeCoord] =
+			float4(.5 * convData + .5, 0, 1);
+#endif
+	}
+}
+
+#undef EdgeId
+
+
+
+
+
+

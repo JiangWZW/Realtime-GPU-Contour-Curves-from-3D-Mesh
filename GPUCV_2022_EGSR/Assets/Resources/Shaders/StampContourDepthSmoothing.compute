@@ -1,0 +1,359 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel StampContourDepthSmoothing_ZGrad
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourFilteringComputeDefs.hlsl"
+
+// #define DEBUG_CONV_DEPTH_PASS
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawStampLinkage;
+
+
+RWByteAddressBuffer CBuffer_BufferRawRasterDataPerSeg;
+#define CONV_BUFFER CBuffer_BufferRawRasterDataPerSeg
+#define CONV_PATCH_BUFFER CBuffer_BufferRawPixelEdgeData
+// #define CONV_PATCH_BUFFER CBuffer_BufferRawRasterDataPerSeg
+
+
+uint _PingPong; // current iteration (not mod2)
+uint _EndIteration; // total iteration count
+float _ViewDepthCutoff; // depth bilateral filtering
+
+// _ZBufferParams: Unity built-in param
+// in case of a reversed depth buffer (UNITY_REVERSED_Z is 1)
+// x = f/n - 1
+// y = 1
+// z = x/f = 1/n - 1/f
+// w = 1/f
+// float4 _ZBufferParams;
+float2 NormalizeEyeDepth(float2 eyeDepthInfo)
+{
+	float NearFarPlaneDist = abs(rcp(_ZBufferParams.w * (1 + rcp(_ZBufferParams.x))));
+
+	return eyeDepthInfo / NearFarPlaneDist;
+}
+
+
+uint PaddedAddr(float id)
+{
+	return id + SMOOTH_RADIUS;
+}
+
+#define DECLARE_PADDING_FUNC(tag, LOAD_GLOBAL_DATA)						\
+void Padding##tag(														\
+	uint groupIdx : SV_GroupIndex,										\
+	uint3 id : SV_DispatchThreadID,										\
+	uint edgeCount)														\
+{																		\
+	float g_paddingId =													\
+		groupIdx < SMOOTH_RADIUS										\
+			? (float)id.x - (float)SMOOTH_RADIUS						\
+			: (float)id.x + (float)SMOOTH_RADIUS;						\
+																		\
+	float lds_paddingId =												\
+		groupIdx < SMOOTH_RADIUS										\
+			? groupIdx													\
+			: (PaddedAddr(groupIdx) + SMOOTH_RADIUS);					\
+																		\
+	if (groupIdx < SMOOTH_RADIUS										\
+		|| (GROUP_SIZE_0 - SMOOTH_RADIUS) <= groupIdx)					\
+	{																	\
+		LDS_ConvData[(uint)lds_paddingId] = LOAD_GLOBAL_DATA(			\
+			(uint)clamp(g_paddingId, .0, (float)(edgeCount - 1))		\
+		);																\
+	}																	\
+}																		\
+
+
+// Patching ------------------------------------------------
+groupshared uint LDS_PatchEdgeIds[NUM_PATCHES_PER_GROUP];
+groupshared CONV_DATA_T LDS_ConvPatch[NUM_PATCHES_PER_GROUP];
+
+#define DECLARE_PATCHING_FUNC(tag, LOAD_GLOBAL_DATA)					\
+void Patching##tag(uint groupIdx : SV_GroupIndex, CONV_DATA_T edgeDir)	\
+{																		\
+	/* Load Patch Data */												\
+	if (groupIdx < NUM_PATCHES_PER_GROUP)								\
+	{																	\
+		uint g_patchId = LDS_PatchEdgeIds[groupIdx];					\
+		LDS_ConvPatch[groupIdx] = LOAD_GLOBAL_DATA(g_patchId);			\
+	}																	\
+}																		\
+
+
+static float BlurKernel[1 + SMOOTH_RADIUS] = {
+	// http://dev.theomader.com/gaussian-kernel-calculator/
+	// Sigma == , Kernel Size == 9
+	// 0.065949, 0.06562, 0.064644, 0.063049, 0.060883, 0.058206, 0.055093, 0.051629, 0.047901
+	// Sigma == 24, Kernel Size == 33
+	0.032704, 0.032676, 0.032591, 0.03245, 0.032253, 0.032002, 0.031698, 0.031343, 0.030937,
+	0.030484, 0.029986, 0.029444, 0.028862, 0.028242, 0.027588, 0.026903, 0.026188
+};
+
+
+#define DECLARE_CONV_PASS_FUNC(tag, CONVOLUTION_FUNC)											\
+void ConvolutionPass##tag(																		\
+	inout CONV_DATA_T curvature,														\
+	CONV_DATA_T convDataOrig,															\
+	SerializedEdgeLinkage linkage,																\
+	SerializedEdgeLinkage tailLinkage,															\
+	uint groupIdx : SV_GroupIndex,																\
+	uint3 id : SV_DispatchThreadID)																\
+{																								\
+	/* 0 1 2 3 4 #i */																			\
+	/* ------- 5 listSize*/																		\
+	/* 4 3 2 1 5 edgeRank*/																		\
+	float listSize = tailLinkage.linkVal;														\
+	float edgeRank = (1 == linkage.tailFlag) ? 0 : linkage.linkVal;								\
+	float i = listSize - edgeRank - 1; /* Local linear index in edge loop list.*/				\
+																								\
+	uint d;																						\
+	float gi_d;																					\
+	float i_d; /* Local index 'i' being moved by distance 'd'*/									\
+	[unroll]																					\
+	for (d = 1; d <= SMOOTH_RADIUS; ++d)														\
+	{																							\
+		i_d = ((uint)(i - ((float)d) + listSize * SMOOTH_RADIUS)) % ((uint)listSize);			\
+		gi_d = (float)(groupIdx)+i_d - i; /* gi_d - gi == i_d - i, gi = (groupIdx)*/			\
+		bool atRightPatch = gi_d >= (float)(GROUP_SIZE_0 + SMOOTH_RADIUS);						\
+		gi_d = atRightPatch																		\
+			? (2 * (float)(SMOOTH_RADIUS)-(listSize - i_d))										\
+			: PaddedAddr(gi_d);																	\
+																								\
+		CONV_DATA_T data = atRightPatch ? LDS_ConvPatch[(uint)gi_d] : LDS_ConvData[(uint)gi_d];	\
+																								\
+		CONVOLUTION_FUNC(d, convDataOrig, data, /* inout */curvature);										\
+	}																							\
+	[unroll]																					\
+	for (d = 1; d <= SMOOTH_RADIUS; ++d)														\
+	{																							\
+		i_d = ((uint)(i + d)) % ((uint)listSize);												\
+		gi_d = (float)(groupIdx)+i_d - i; /* gi_d - gi == i_d - i, gi = (groupIdx) */			\
+		bool atLeftPatch = gi_d < -1 * ((float)(SMOOTH_RADIUS));								\
+		gi_d = atLeftPatch																		\
+			? i_d																				\
+			: PaddedAddr(gi_d);																	\
+																								\
+		CONV_DATA_T data = atLeftPatch ? LDS_ConvPatch[(uint)gi_d] : LDS_ConvData[(uint)gi_d];	\
+																								\
+		CONVOLUTION_FUNC(d, convDataOrig, data, /* inout */curvature);										\
+	}																							\
+}																								\
+
+
+uint LoadLinkage(uint id)
+{
+	return (CBuffer_BufferRawStampLinkage.Load(CBuffer_BufferRawEdgeSerializedLinkage_AddrAt(id)));
+}
+
+
+#define DECLARE_SETUP_CONV_CACHE_FUNC(tag)																			\
+void SetupConvolutionLDSCache##tag(																					\
+	uint3 id : SV_DispatchThreadID,																					\
+	uint groupIdx : SV_GroupIndex,																					\
+	uint3 gIdx : SV_GroupID,																						\
+	float2 convData,																								\
+	uint EdgeCount, 																								\
+	out SerializedEdgeLinkage linkage, 																				\
+	out SerializedEdgeLinkage tailLinkage){																			\
+	/* Store data into LDS */																						\
+	LDS_ConvData[PaddedAddr(groupIdx)] = convData;																	\
+																													\
+	/* -------------------------------------------------------------------------- */								\
+	/* Estimate edge direction */																					\
+	/* --------------------------------------------------------------------------  */								\
+	/* Edge topology analysis */																					\
+	uint linkData = LoadLinkage(EdgeId);																			\
+	linkage = DecodeSerializedEdgeLinkage(linkData);																\
+																													\
+	uint linkDataTail = LoadLinkage(EdgeId + OffsetToEdgeSegmentTail(linkage));										\
+	tailLinkage = DecodeSerializedEdgeLinkage(linkDataTail);														\
+																													\
+	uint edgeLoopLen = tailLinkage.linkVal;																			\
+																													\
+																													\
+	/* ------------ Loading Extra Neighboring Data ---------------- */												\
+	/* Step 1. Load patching data address */																		\
+	GroupMemoryBarrierWithGroupSync();																				\
+	if (groupIdx < NUM_PATCHES_PER_GROUP)																				\
+	{																												\
+		LDS_PatchEdgeIds[groupIdx] = CONV_PATCH_BUFFER.Load(CBuffer_PixelEdgeData_EdgeConvPatch_AddrAt(gIdx.x, groupIdx));				\
+	}																												\
+	GroupMemoryBarrierWithGroupSync();																				\
+																													\
+																													\
+	/* Step 2. use address to fetch patch data */																	\
+	CAT(Patching, tag)(groupIdx, convData);																			\
+	GroupMemoryBarrierWithGroupSync();																				\
+																													\
+																													\
+	/* Step 3. Padding at left & right */																			\
+	CAT(Padding, tag)(groupIdx, id, EdgeCount);																		\
+	GroupMemoryBarrierWithGroupSync();																				\
+}																														\
+
+#define EdgeId (id.x)
+#undef CONV_DATA_T
+#define CONV_DATA_T float2
+#undef CONV_DATA_STRIDE
+#define CONV_DATA_STRIDE 2
+
+groupshared CONV_DATA_T LDS_ConvData[SMOOTH_LDS_LEN];
+
+#define Z_GRAD(convData) (convData.x)
+#define Z_VIEW(convData) (convData.y)
+void Smoothing(
+	uint d,
+	CONV_DATA_T dataOriginal,
+	CONV_DATA_T dataNeighbor,
+	inout CONV_DATA_T convData)
+{
+	Z_GRAD(convData) += BlurKernel[d] * Z_GRAD(dataNeighbor);
+	Z_VIEW(convData) += 
+		abs(Z_VIEW(dataNeighbor) - Z_VIEW(dataOriginal)) < _ViewDepthCutoff
+			? Z_VIEW(dataNeighbor) : Z_VIEW(dataOriginal);
+}
+
+
+/**
+ * \return .x: screen space depth-gradient, .y: view depth
+ */
+CONV_DATA_T LoadEdgeDepthInfo(uint edgeId)
+{
+	EdgeAttrib attrs = DecodeEdgeAttrib(
+		CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, edgeId)));
+	CONV_DATA_T depthInfo = asfloat(
+		uint2(
+			CBuffer_BufferRawStampGBuffer.Load(
+				CBuffer_BufferRawStamp_ScreenDepthGrad_AddrAt(attrs.stampInfo)),
+			CBuffer_BufferRawStampGBuffer.Load(
+				CBuffer_BufferRaw_StampViewDepth_AddrAt(attrs.stampInfo))
+		)
+	);
+
+	return NormalizeEyeDepth(depthInfo);
+}
+#undef LOAD_GLOBAL_CONV_DATA_FUNC
+#define LOAD_GLOBAL_CONV_DATA_FUNC LoadDepthConvData
+CONV_DATA_T LoadDepthConvData(uint edgeId)
+{
+	CONV_DATA_T depthInfo;
+	if (_PingPong == 0)
+	{
+		depthInfo = LoadEdgeDepthInfo(edgeId);
+	}else
+	{
+		uint subbuff = 2 + // Base sub-buffer offset
+			CONV_DATA_STRIDE * (_PingPong % 2); // X1 uint per slot per sub-buffer
+
+		depthInfo = asfloat(
+			CONV_BUFFER.CAT(Load, CONV_DATA_STRIDE)
+			(
+				Conv_Buffer_ConvData_AddrAt(subbuff, 0)
+				+ (edgeId << BITS_DWORD_OFFSET)
+			)
+		);
+	}
+	return depthInfo;
+}
+
+#undef STORE_GLOBAL_CONV_DATA_FUNC
+#define STORE_GLOBAL_CONV_DATA_FUNC StoreDepthConvData
+void StoreDepthConvData(uint edgeId, CONV_DATA_T depthInfo)
+{
+	[branch]
+	if (_PingPong != _EndIteration - 1)
+	{
+		uint subbuff = 2 + 
+			CONV_DATA_STRIDE * ((_PingPong + 1) % 2);
+
+		CONV_BUFFER.CAT(Store, CONV_DATA_STRIDE)
+		(
+			Conv_Buffer_ConvData_AddrAt(subbuff, 0)	// base offset
+				+ (edgeId << BITS_DWORD_OFFSET),		// item offset
+
+			asuint(depthInfo)
+		);
+	}else
+	{
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_EdgeDepth_AddrAt(edgeId),
+			asuint(Z_VIEW(depthInfo))
+		);
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_EdgeZGrad_AddrAt(edgeId),
+			asuint(Z_GRAD(depthInfo))
+		);
+	}
+}
+
+DECLARE_CONV_PASS_FUNC(Smooth, Smoothing)
+DECLARE_PADDING_FUNC(SmoothDepthInfo, LoadDepthConvData)
+DECLARE_PATCHING_FUNC(SmoothDepthInfo, LoadDepthConvData)
+DECLARE_SETUP_CONV_CACHE_FUNC(SmoothDepthInfo)
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourDepthSmoothing_ZGrad( 
+	// Note: actually, depth is also smoothed via blateral filtering
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	// --------------------------------------------------------------------------
+	// Load Global Data && Store into LDS
+	// --------------------------------------------------------------------------
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	CONV_DATA_T convData = LOAD_GLOBAL_CONV_DATA_FUNC(min(EdgeId, EdgeCount - 1));
+
+	SerializedEdgeLinkage linkage, tailLinkage;
+
+	SetupConvolutionLDSCacheSmoothDepthInfo(
+		id, groupIdx, gIdx, convData, EdgeCount, // in
+		linkage, tailLinkage // out
+	);
+
+	// Step 4. Apply actual convolution iterations
+	CONV_DATA_T convDataOrig = convData;
+	Z_GRAD(convData) *= BlurKernel[0]; // z-grad
+
+	ConvolutionPassSmooth(
+		/* inout */convData,
+		convDataOrig,
+		linkage, tailLinkage,
+		groupIdx, id
+	);
+
+	Z_VIEW(convData) *= (1.0f / (1.0f + 2.0f * SMOOTH_RADIUS));
+
+	if (EdgeId < EdgeCount)
+	{
+		STORE_GLOBAL_CONV_DATA_FUNC(EdgeId, convData);
+
+#ifdef DEBUG_CONV_DEPTH_PASS
+		uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+		);
+		EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+
+		float2 stampCoord = (float2)
+			DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo)));
+
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+
+		_DebugTexture[edgeCoord] =
+			float4(convData.x, -convData.y * 80.0f, 0, 1);
+#endif
+	}
+}

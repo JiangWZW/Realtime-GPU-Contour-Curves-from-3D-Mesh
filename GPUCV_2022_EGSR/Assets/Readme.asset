@@ -1,0 +1,51 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: fcf7219bab7fe46a1ad266029b2fee19, type: 3}
+  m_Name: Readme
+  m_EditorClassIdentifier: 
+  icon: {fileID: 2800000, guid: 7801804018a7dcf42abb827444e18660, type: 3}
+  title: Universal RP
+  sections:
+  - heading: Universal Render Pipeline
+    text: 'This template is a good starting point for developers focused platform reach.
+      The Universal Render Pipeline offers both real-time lighting and baked lighting
+      in a single-pass forward renderer. This decreases the amount of necessary draw
+      calls, making Universal RP idea for projects that must scale across platforms, including
+      mobile hardware. Universal RP also has an optimized 2D renderer, complete with 2D
+      lights and features like pixel perfect rendering.'
+    linkText:
+    url:
+  - heading: 
+    text: 'To read more about the Universal Render Pipeline, see this Universal RP documentation
+      site: '
+    linkText: Universal RP documentation site
+    url: https://docs.unity3d.com/Packages/com.unity.render-pipelines.universal@7.0
+  - heading: 
+    text: 'This project also includes the new Shader Graph tool. With this tool,
+      you can create shaders with a visual node editor instead of writing code. Read
+      more about the Shader Graph here:'
+    linkText: Shader Graph
+    url: https://docs.unity3d.com/Packages/com.unity.shadergraph@7.0
+  - heading: 
+    text: 'This project also make use of the new Post-processing v3, built with perfomance
+    in mind, this runs better and makes use of the generic volume system within Unity.'
+    linkText: 
+    url: 
+  - heading: 
+    text: This project uses the new Package Manager to bring you the latest features
+      Unity has to offer. Open the Package Manager from Windows > Package Manager
+      and make sure you're using the most recent version of the Universal Render
+      Pipeline. To update packages, select your desired package from the list on
+      the left, and click the Update to button in the bottom right corner.
+    linkText: 
+    url: 
+  loadedLayout: 1

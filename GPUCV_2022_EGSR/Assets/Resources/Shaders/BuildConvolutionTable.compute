@@ -1,0 +1,297 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel BuildConvolutionTable_EdgeLoop
+#pragma kernel BuildConvolutionTable_Particle
+#pragma kernel BuildConvolutionTable_Test
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourFilteringComputeDefs.hlsl"
+
+// #define DEBUG_EDGE_LOOP
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+// -------------------------------
+
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawProceduralGeometry;
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+ByteAddressBuffer CBuffer_BufferRawStampLinkage;
+
+
+RWByteAddressBuffer CBuffer_BufferRawRasterDataPerSeg;
+#define CONV_BUFFER CBuffer_BufferRawRasterDataPerSeg
+#define CONV_PATCH_BUFFER CBuffer_BufferRawPixelEdgeData
+
+// SMOOTH_RADIUS is to be deprecated
+#ifdef SMOOTH_RADIUS
+#	undef SMOOTH_RADIUS
+#endif
+
+#ifdef NUM_PATCHES_PER_GROUP
+#	undef NUM_PATCHES_PER_GROUP
+#	define NUM_PATCHES_PER_GROUP ((2 * EDGE_CONV_RADIUS))
+#endif
+
+#undef NULL_LEFT_TAIL
+#undef NULL_RIGHT_HEAD
+
+#ifdef NUM_PATCHES_PER_GROUP
+#	undef NUM_PATCHES_PER_GROUP
+#endif
+#ifdef GROUP_SIZE_CONV
+#	undef GROUP_SIZE_CONV
+#endif
+
+
+
+
+
+// Inputs ------ -----------------------
+#define tag Test
+#define MAX_CONV_RADIUS EDGE_CONV_RADIUS
+#define GROUP_SIZE_CONV 256
+struct ConvolutionData
+{
+	uint d;
+};
+#define T_CONV ConvolutionData
+
+T_CONV LoadConvData(uint elemIdGl)
+{
+	T_CONV res;
+	res.d = WangHash(elemIdGl) % 56;
+
+	return res;
+}
+#define DEVICE_LOAD_CONV_DATA(elemIdGl) (LoadConvData(elemIdGl))
+
+uint LoadPatchIdGl(uint blockId, uint patchIdLc)
+{
+	return CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_EdgeConvPatch_AddrAt(
+			blockId, patchIdLc
+		)
+	);
+}
+#define DEVICE_LOAD_CONV_PATCH_ID(blockId, patchIdLc) (LoadPatchIdGl(blockId, patchIdLc))
+
+#include "../ShaderLibrary/SegmentedConvolutionPrimitive_Loop1D.hlsl"
+
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void BuildConvolutionTable_EdgeLoop(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+#define EdgeId ((id.x))
+	bool validThread = EdgeId < EdgeCount;
+
+	// --------------------------------------------------------------------------
+	// Estimate edge direction
+	// --------------------------------------------------------------------------
+	// Edge topology analysis
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage, 
+		EdgeId
+	);
+	bool isSegHead = validThread && (EdgeId == edgeloop.headEdgeId);
+	bool isSegTail = validThread && (EdgeId == edgeloop.tailEdgeId);
+	uint segHead = edgeloop.headEdgeId;
+	uint segTail = edgeloop.tailEdgeId;
+	uint segLen = edgeloop.length;
+
+	ComptueBlockPatchElemIds_Test(
+		groupIdx, 
+		isSegHead, isSegTail, 
+		segHead, segTail, segLen
+	);
+	
+
+	if (groupIdx < NUM_PATCHES_PER_GROUP)
+	{
+		CONV_BUFFER.Store(
+			Conv_Buffer_PatchData_AddrAt(
+				gIdx.x, groupIdx),
+			LDS_PatchElemIds_Test[groupIdx]
+		);
+		CONV_PATCH_BUFFER.Store(
+			CBuffer_PixelEdgeData_EdgeConvPatch_AddrAt(
+				gIdx.x, groupIdx),
+			LDS_PatchElemIds_Test[groupIdx]
+		);
+	}
+}
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void BuildConvolutionTable_Particle(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint ParticleCount = CBuffer_PBDParticleCounter;
+#define ParticleId ((id.x))
+	bool validThread = ParticleId < ParticleCount;
+
+	uint ptclState = CBuffer_BufferRawProceduralGeometry.Load(
+		CBuffer_PCG_PBD_State_AddrAt(ParticleId)
+	);
+	uint ptclRank = GetParticleState(PTCL_RANK, ptclState);
+	bool tailPtcl = GetParticleState(PTCL_TAIL, ptclState);
+	bool headPtcl = ptclRank == 0;
+
+	uint springLen = CBuffer_BufferRawProceduralGeometry.Load(
+			CBuffer_PCG_PBD_StringLength_AddrAt(ParticleId)
+		);
+
+
+	// Edge topology analysis
+	EdgeLoopTopology springLoop; // Suppose the worse case: a loop
+	springLoop.headEdgeId = ParticleId - ptclRank;
+	springLoop.length = springLen;
+	springLoop.tailEdgeId = 
+		springLoop.headEdgeId + springLoop.length - 1;
+
+
+	bool isSegHead = validThread && (headPtcl);
+	bool isSegTail = validThread && (tailPtcl);
+	uint segHead = springLoop.headEdgeId;
+	uint segTail = springLoop.tailEdgeId;
+	uint segLen = springLoop.length;
+
+	ComptueBlockPatchElemIds_Test(
+		groupIdx,
+		isSegHead, isSegTail,
+		segHead, segTail, segLen
+	);
+
+
+	if (groupIdx < NUM_PATCHES_PER_GROUP)
+	{
+		CONV_BUFFER.Store(
+			Conv_Buffer_PatchData_AddrAt(
+				gIdx.x, groupIdx),
+			LDS_PatchElemIds_Test[groupIdx]
+		);
+		CONV_PATCH_BUFFER.Store(
+			CBuffer_PixelEdgeData_EdgeConvPatch_AddrAt(
+				gIdx.x, groupIdx),
+			LDS_PatchElemIds_Test[groupIdx]
+		);
+	}
+}
+
+
+
+
+[numthreads(GROUP_SIZE_CONV, 1, 1)]
+void BuildConvolutionTable_Test(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage,
+		id.x
+	);
+	uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+
+	ConvolutionData convDataOrig, convData;
+	SetupSegmentedConvolution_Test(
+		gIdx, groupIdx, EdgeCount, 
+		/*out*/ convData
+	);
+	convDataOrig = convData;
+
+
+	uint dbgInfo = 
+		CBuffer_PixelEdgeData_EdgeTemp5_AddrAt(EdgeCount - 1);
+
+	for (uint d = 1; d <= MAX_CONV_RADIUS; ++d)
+	{
+		bool2 succ;
+		T_CONV convDataNeigh;
+
+		convDataNeigh = LoadLDSConvData_AtLeft_Test(
+			d,
+			gIdx.x, groupIdx,
+			edgeloop.length, edgeloop.headEdgeId
+		);
+		convData.d += convDataNeigh.d;
+
+		convDataNeigh = LoadLDSConvData_AtRight_Test(
+			d,
+			gIdx.x, groupIdx,
+			edgeloop.length, edgeloop.headEdgeId
+		);
+		convData.d += convDataNeigh.d;
+	}
+
+
+	if (EdgeId < EdgeCount)
+	{ 
+		uint offset = 0;
+		if (EdgeId == 0)
+		{
+			CBuffer_BufferRawDebug.Store(
+				offset, EdgeCount
+			);
+		}
+		offset += (1 << BITS_WORD_OFFSET);
+
+		if (EdgeId == 0)
+		{
+			CBuffer_BufferRawDebug.Store(
+				offset, ComputeNumGroups(EdgeCount, GROUP_SIZE_CONV, BTIS_GROUP_CONV)
+			);
+		}
+		offset += (1 << BITS_WORD_OFFSET);
+
+		if (EdgeId == 0)
+		{
+			CBuffer_BufferRawDebug.Store(
+				offset, EDGE_CONV_RADIUS
+			);
+		}
+		offset += (1 << BITS_WORD_OFFSET);
+
+		CBuffer_BufferRawDebug.Store(
+			offset + (EdgeId << BITS_WORD_OFFSET),
+			edgeloop.length
+		);
+		offset += (EdgeCount << BITS_WORD_OFFSET);
+
+		CBuffer_BufferRawDebug.Store(
+			offset + (EdgeId << BITS_WORD_OFFSET),
+			edgeloop.headEdgeId
+		);
+		offset += (EdgeCount << BITS_WORD_OFFSET);
+
+		CBuffer_BufferRawDebug.Store(
+			offset + (EdgeId << BITS_WORD_OFFSET),
+			convDataOrig.d
+		);
+		offset += (EdgeCount << BITS_WORD_OFFSET);
+		 
+		CBuffer_BufferRawDebug.Store(
+			offset + (EdgeId << BITS_WORD_OFFSET),
+			convData.d
+		);
+		offset += (EdgeCount << BITS_WORD_OFFSET);
+
+		CBuffer_BufferRawDebug.Store(
+			offset + (EdgeId << BITS_WORD_OFFSET),
+			dbgInfo
+		);
+		offset += (EdgeCount << BITS_WORD_OFFSET);
+	}
+}

@@ -1,0 +1,551 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel StampVertexGenerator_PathRegistration
+#pragma kernel StampVertexGenerator_EdgeStylization
+
+#pragma use_dxc
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StampVertexGeneratorComputeDefs.hlsl"
+
+
+// #define DEBUG_KERNEL_I
+// #define DEBUG_KERNEL_RPJ_1
+
+
+// TODO: make render mode dynamic
+#define RENDER_PATH
+uint _RenderPath;
+bool RenderPath() { return _RenderPath == 1; }
+
+Texture2D<float> _CurveTex_Debug_0;
+
+RWTexture2D<float4> _DebugTexture;
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+RWTexture2D<float4> _DebugTexture1;
+
+Texture2D<float4> _CameraColorAttachmentA;
+
+Texture2D<float> _CurveTex_0; // RFloat
+Texture2D<float> _CurveTex_1; // RFloat
+Texture2D<float> _CurveTex_2; // RFloat
+Texture2D<float> _CurveTex_3; // RFloat
+SamplerState sampler_linear_clamp;
+SamplerState sampler_point_repeat;
+
+RWByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawStampLinkage;
+RWByteAddressBuffer CBuffer_BufferRawFlagsPerStamp;
+RWByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawProceduralGeometry;
+
+RWStructuredBuffer<uint> CBuffer_StampDrawIndirectArgs;
+RWStructuredBuffer<uint> CBuffer_ContourCoverageTestDrawIndirectArgs;
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgs;
+
+
+
+// Vertex Output Formats
+uint _VertexOutputFormat; // vertex data varies in different render passes
+#define OUT_VERTS_CONTOUR_SCREEN 0u
+#define OUT_VERTS_CONTOUR_COVERAGE 1u
+float _CoverageRadius;
+
+
+
+/**
+ * \brief Loads Stamp Coord in Screen Space
+ * \param stampId
+ * \param screenResInv
+ * \return
+ */
+uint2 LoadStampCoord(uint stampId)
+{
+	uint2 stampCoord = 
+		DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+			CBuffer_BufferRawStampPixels_AddrAt(stampId)
+		));
+
+	return stampCoord;
+}
+
+float2 LoadSmoothedEdgeCoord(uint edgeId)
+{
+	uint2 smoothCoordPacked =
+		CBuffer_BufferRawPixelEdgeData.Load2(
+			CBuffer_PixelEdgeData_SmoothCoord_AddrAt(edgeId)
+		);
+
+	return asfloat(smoothCoordPacked);
+}
+
+float2 LoadDefaultStampScale(float2 screenResInv)
+{
+	return float2(_LineWidth, _StampLength) * screenResInv;
+}
+float LoadEdgeCurvature(uint edgeId)
+{
+	return asfloat(
+		CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_EdgeCurvatureDerivative_AddrAt(edgeId)));
+}
+void LoadStrokeParameter(uint edgeId, out uint strokeRank, out uint strokeLength)
+{
+	uint2 params = CBuffer_BufferRawPixelEdgeData.Load2(
+		CBuffer_PixelEdgeData_EdgeParam_AddrAt(
+			EDGE_PARAM_STROKE,
+			edgeId
+		)
+	);
+
+	strokeRank = params.x;
+	strokeLength = params.y;
+}
+
+float LoadEdgeDepthGradient(uint edgeId)
+{
+	return asfloat(CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_EdgeZGrad_AddrAt(edgeId)
+	));
+}
+
+
+// TODO: reuse these functions
+uint F32_TO_U32(float f32) { return ((uint)((f32)+.1f)); }
+uint ComputeSegmentHeadID(
+	float edgeIdLocal, float edgeLoopHeadId,
+	uint edgeLoopLenU32, uint segRank
+) {
+	return (
+		F32_TO_U32(edgeLoopHeadId) +
+		F32_TO_U32(edgeIdLocal
+			- (float)segRank
+			+ (float)edgeLoopLenU32
+		) % edgeLoopLenU32
+	);
+}
+
+#define HIDDEN_PATH 0xffffffff
+
+void CompactBrushPath(
+	uint segmentLength, bool spawner,
+	out uint drawStampID)
+{
+	if (spawner && (_VertexOutputFormat == OUT_VERTS_CONTOUR_SCREEN))
+	{
+		InterlockedAdd(
+			// Note: this counter is zeroed in historyFiltering shader
+			CBuffer_SpineCounter,
+			segmentLength,
+			drawStampID
+		);
+	}
+	if (spawner && (_VertexOutputFormat == OUT_VERTS_CONTOUR_COVERAGE))
+	{
+		InterlockedAdd(
+			CBuffer_ContourCoverageSpineCounter,
+			segmentLength,
+			drawStampID
+		);
+		// Collect maximum stroke len
+		InterlockedMax(
+			CBuffer_PBDMaximumStrokeLength,
+			segmentLength
+		);
+	}
+}
+
+/**
+ * \return If this path sould be drawn on screen. 
+ */
+bool CompactDrawPathSpine(
+	uint edgeId : SV_GroupIndex, uint stkRank,
+	out uint spineId)
+{
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage, edgeId
+	);
+	
+	uint edgeIdLocal = edgeId - edgeloop.headEdgeId;
+	
+	uint stkHeadId = ComputeSegmentHeadID(
+		(float)edgeIdLocal, (float)edgeloop.headEdgeId, 
+		edgeloop.length,
+		stkRank
+	);
+	// Valid stroke start is stored at head edge
+	uint stkStart = CBuffer_BufferRawPixelEdgeData.Load(
+		// From "StampVertexGenerator_PathRegistration"
+		CBuffer_PixelEdgeData_EdgeTemp1_AddrAt(stkHeadId)
+	);
+	spineId = stkStart == HIDDEN_PATH ? 
+		HIDDEN_PATH : (stkRank + stkStart);
+	
+	return stkStart != HIDDEN_PATH;
+}
+
+void CompactDrawStamps(
+	uint groupIdx : SV_GroupIndex,
+	bool draw,
+	out uint drawStampID)
+{
+	drawStampID = StreamCompaction_Compaction_2(groupIdx, draw);
+}
+
+float4 _CurvatureParams;
+float4 _DepthParams;
+// .xy: _Min/MaxCurvature
+// .zw: ?
+
+float2 ComputeStylizedScale(
+	float strokeParam,
+	float zGrad,
+	float curv, // signed
+	float strokeLength
+)
+{
+	// Init
+	float2 scale = float2(1.0, _ScreenParams.y / _ScreenParams.x); // TODO: dynamic scale
+	// Clip short strokes, since they are temporally unstable, and
+	// also not visually plausible for stylization
+	scale = lerp(MinStrokeScale(), scale, smoothstep(16.0f, 96.0f, strokeLength));
+
+	// if (strokeLength < 64) scale = 0;
+
+	float paramScale = _CurveTex_1.SampleLevel(
+		sampler_linear_clamp,
+		float2(strokeParam, 0.5),
+		0
+	);
+	scale *= paramScale;
+	
+	float curvScale = _CurveTex_0.SampleLevel(
+		sampler_linear_clamp,
+		float2(curv, 0.5),
+		0
+	);
+	// scale *= (curvScale);
+
+	zGrad = saturate((zGrad - _DepthParams.x) / (_DepthParams.y - _DepthParams.x));
+	float depthScale = _CurveTex_3.SampleLevel(
+		sampler_linear_clamp,
+		float2(zGrad, 0.5),
+		0
+	);
+	scale *= (depthScale);
+
+
+	scale = min(float2(1, 1), scale);
+		
+	return scale;
+}
+
+
+void SpawnStampVertices(
+	uint edgeId, uint stampId, 
+	uint groupIdx : SV_GroupIndex,
+	
+	bool drawEdge, bool lastEdge,
+	
+	float2 edgeCoord, float2 edgeTangent,
+	float zGrad, float curv,
+
+	float2 edgeCoordSmooth_stkMid,
+
+	EdgeLoopTopology edgeloop, 
+	uint strokeRank, uint strokeLength, uint maxStrokeLen, 
+	float2 screenResInv,
+
+	out bool outputVerts
+){
+	uint spineId = 0;
+	outputVerts = CompactDrawPathSpine(
+		edgeId, strokeRank, 
+		spineId /*out*/
+	);
+	float stylizedWidth = 
+		ComputeStylizedScale(
+			(float)strokeRank / (float)strokeLength,
+			zGrad,
+			curv,
+			strokeLength
+		).x;
+	stylizedWidth *= (_LineWidth * screenResInv.x);
+
+
+	float strokeWidth = 0;
+	if (_VertexOutputFormat == OUT_VERTS_CONTOUR_SCREEN)
+	{
+		strokeWidth = stylizedWidth;
+	}
+	if (_VertexOutputFormat == OUT_VERTS_CONTOUR_COVERAGE)
+	{
+		strokeWidth = (_CoverageRadius * screenResInv.x);
+	}
+
+	// ------------------------------------------------
+	// Setup stylized stroke rendering
+	// ------------------------------------------------
+	float2 normal = float2(-edgeTangent.y, edgeTangent.x);
+	float3x2 vertices = ComputeWingQuadVerts(
+		(edgeCoord) * screenResInv * 2.0f - 1.0f,
+		float2(-edgeTangent.y, edgeTangent.x),
+		strokeWidth.x
+	);
+
+	float4 screenCol = _CameraColorAttachmentA.SampleLevel(
+		sampler_linear_clamp,
+		float2(edgeCoordSmooth_stkMid * screenResInv),
+		0
+	);
+
+	if (drawEdge && outputVerts)
+	{
+		// Output stroke verts
+		CBuffer_ProceduralGeometry_StrokePathVertices_Store(
+			CBuffer_BufferRawProceduralGeometry,
+			vertices, spineId
+		);
+
+		bool renderEdge = !(lastEdge && drawEdge);
+		[branch] if (_VertexOutputFormat == OUT_VERTS_CONTOUR_SCREEN)
+		{
+			float texLen = TEX_LEN; min(TEX_LEN, strokeLength);
+			CBuffer_ProceduralGeometry_StrokeVertColor_Store(
+				// debug only(for now)
+				CBuffer_BufferRawProceduralGeometry,
+				float4(
+					asfloat(PackR8G8B8A8(screenCol)),
+					fmod((float)strokeRank, texLen) / texLen,
+					// (float)strokeRank / (float)strokeLength, 
+					(float)strokeLength,
+					renderEdge // last edge in brush path won't generate spine geometry
+				),
+				spineId
+			);
+		}
+		[branch] if (_VertexOutputFormat == OUT_VERTS_CONTOUR_COVERAGE)
+		{
+			uint stkHeadPtclId = MoveEdgeIdAlongEdgeLoop(
+				edgeloop, edgeId, -(float)strokeRank
+			);
+			float viewDepth = asfloat(
+				CBuffer_BufferRawStampGBuffer.Load(
+					CBuffer_BufferRaw_StampViewDepth_AddrAt(stampId)));
+			float clipDepth = ViewToHClipZ(_ZBufferParams, viewDepth);
+			SpineData_ContourCoverage coverageData;
+			coverageData.Setup(
+				stkHeadPtclId, strokeLength, maxStrokeLen, clipDepth,
+				renderEdge
+			);
+			CBuffer_BufferRawProceduralGeometry.Store4// note here
+			(
+				CBuffer_ProceduralGeometry_StrokeCustomData_AddrAt(
+					spineId, coverageData.Stride()
+				),
+				coverageData.Encode()
+			);
+		}
+
+	}
+}
+
+bool IsStrokeDrawable(uint edgeAttrsRaw)
+{
+	bool deleted =
+		GetEdgeAttrib(
+			BIT_BEG_DEL_FLAG,
+			BIT_LEN_DEL_FLAG,
+			edgeAttrsRaw);
+	bool drawEdge = (!deleted) && (
+		1 == GetEdgeAttrib(
+			BIT_BEG_DRAW_FLAG,
+			BIT_LEN_DRAW_FLAG,
+			edgeAttrsRaw)
+		);
+	return drawEdge;
+}
+
+#define EdgeId (id.x)
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampVertexGenerator_PathRegistration(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+#ifdef RENDER_PATH
+	uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	bool validThread = id.x < EdgeCount;
+
+	uint edgeAttrsRaw = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(
+			0, EdgeId)
+	);
+	bool drawEdge = IsStrokeDrawable(edgeAttrsRaw);
+
+	
+	uint stkRank, stkLen;
+	CBuffer_PixelEdgeData_EdgeParam_LoadAll(
+		CBuffer_BufferRawPixelEdgeData,
+		EDGE_PARAM_STROKE, EdgeId,
+		stkRank, stkLen
+	);
+
+	uint pathStart = 0;
+	bool drawStroke = drawEdge && validThread;
+	bool spawnStroke = RenderPath() && (stkRank == 0) && drawStroke && validThread;
+	CompactBrushPath( // Allocate space for each stroke
+		stkLen, 
+		spawnStroke, 
+		pathStart
+	);
+	
+	if (validThread)
+	{
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_EdgeTemp1_AddrAt(EdgeId),
+			spawnStroke ? pathStart : HIDDEN_PATH
+		);
+	}
+#endif
+}
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampVertexGenerator_EdgeStylization(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	float2 screenResInv = (_ScreenParams.zw - 1.0f);
+
+	bool validThread = EdgeId < EdgeCount;
+	
+	uint edgeAttrsRaw = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(
+			0, EdgeId)
+	);
+	bool drawEdge = IsStrokeDrawable(edgeAttrsRaw);
+	EdgeAttrib edgeAttrs = DecodeEdgeAttrib(edgeAttrsRaw);
+
+	// Load Geometry
+	float2 edgeTangent = UnpackUnitVector_2D(
+		CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_EdgeTangent_AddrAt(EdgeId)
+		)
+	);
+	uint2 stampCoord = LoadStampCoord(edgeAttrs.stampInfo);
+	float2 edgeCoordSmoothed = LoadSmoothedEdgeCoord(EdgeId);
+
+	float zGrad = LoadEdgeDepthGradient(EdgeId);
+	float curv = LoadEdgeCurvature(EdgeId);
+
+
+	// Load Topology
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage, EdgeId
+	);
+	uint strokeRank, strokeLength;
+	LoadStrokeParameter(EdgeId, strokeRank, strokeLength);
+
+	uint edgeId_stkMid = MoveEdgeIdAlongEdgeLoop(
+		edgeloop, EdgeId - strokeRank, strokeLength / 2
+	);
+	float2 edgeCoordSmooth_stkMid = LoadSmoothedEdgeCoord(edgeId_stkMid);
+	
+	
+	// Generate stamp vertices
+	LDS_PrevGroupSum1 = 0;
+	GroupMemoryBarrierWithGroupSync();
+	bool spawnVerts = false;
+	SpawnStampVertices(
+		EdgeId, edgeAttrs.stampInfo, 
+		groupIdx,
+		drawEdge && RenderPath() && validThread, 
+		(strokeRank == (strokeLength - 1)),
+		
+		edgeCoordSmoothed, 
+		edgeTangent, zGrad, curv,
+		
+		edgeCoordSmooth_stkMid, 
+
+		edgeloop, 
+		strokeRank, strokeLength, CBuffer_PBDMaximumStrokeLength, 
+		
+		screenResInv,
+
+		// dbg only
+		spawnVerts
+	);
+
+	 
+	// Fill Draw Args
+	if ((id.x == 0u) && (_VertexOutputFormat == OUT_VERTS_CONTOUR_SCREEN))
+	{
+		CBuffer_StampDrawIndirectArgs[0] =
+			POINTS_PER_WING_QUAD * CBuffer_SpineCounter;
+	}
+	if ((id.x == 0u) && (_VertexOutputFormat == OUT_VERTS_CONTOUR_COVERAGE))
+	{
+		CBuffer_ContourCoverageTestDrawIndirectArgs[0] =
+			POINTS_PER_WING_QUAD * CBuffer_ContourCoverageSpineCounter;
+	}
+
+
+
+#ifdef DEBUG_KERNEL_I
+	if (EdgeId < EdgeCount)
+	{
+		EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+			false, CBuffer_BufferRawStampLinkage, EdgeId
+		);
+
+		float2 stampTangent = GET_STAMP_GBUFFER_TANGENT(
+		CBuffer_BufferRawStampGBuffer.Load(
+			CBuffer_BufferRawStampVectorInfo_AddrAt(edgeAttrs.stampInfo)
+		));
+		float2 coarseMotionVec = asfloat(
+			CBuffer_BufferRawStampGBuffer.Load2(
+				CBuffer_BufferRawStampMotionVector_AddrAt(
+					edgeAttrs.stampInfo
+				)
+			));
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttrs.edgeDir);
+
+		if (validThread/*drawEdge*/)
+		{
+			float4 dbgCol =
+				zGrad;
+				float4(stampTangent * .5 + .5, 0, 1);
+				drawEdge ? 
+				float4(
+				RandColRgb(
+					strokeLength,
+					strokeLength * strokeLength
+				), 1
+			) : COL_R;
+			_DebugTexture[stampCoord] = dbgCol;
+
+			dbgCol =
+				float4(edgeTangent * .5 + .5, 0, 1);
+			float4(
+				RandColRgb(strokeLength, strokeLength / 3), 
+				1
+			);
+			_DebugTexture1[edgeCoord] = dbgCol;
+		}
+	}
+#endif
+
+}
+#undef EdgeId
+
+ 
+
+
+

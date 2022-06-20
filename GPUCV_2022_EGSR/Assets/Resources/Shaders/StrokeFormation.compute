@@ -1,0 +1,1000 @@
+// #pragma kernel StrokeFormation_CurveFitting
+// #pragma kernel StrokeFormation_ReConnection
+// #pragma kernel StrokeFormation_UpdateLinkage
+//
+// // GPU Implementation of Paper
+// // "Curvature and torsion estimators based on parametric curve fitting"
+//
+//
+// #include "../ShaderLibrary/ComputeKernelConfigs/StrokeFormationComputeDefs.hlsl"
+//
+// // #define DEBUG_SAMPLE_DEPTH
+// // #define DEBUG_KERNEL_0
+// // #define DEBUG_KERNEL_1
+//
+//
+// // Debug Resources ----------------------------------
+// RWStructuredBuffer<uint> CBuffer_BufferRawDebug;
+// RWTexture2D<float4> _DebugTexture;
+// Texture2D<float4> _CameraDepthTexture;
+// SamplerState sampler_linear_clamp;
+// // --------------------------------------------------
+//
+// StructuredBuffer<uint> CBuffer_CachedArgs;
+// RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+// ByteAddressBuffer CBuffer_BufferRawStampPixels;
+// ByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+//
+// RWByteAddressBuffer CBuffer_BufferRawStrokeData;
+// RWByteAddressBuffer CBuffer_BufferRawStampLinkage;
+// RWByteAddressBuffer CBuffer_BufferRawFlagsPerStamp;
+// RWStructuredBuffer<int> CBuffer_DispatchIndirectArgs;
+// RWStructuredBuffer<int> CBuffer_DispatchIndirectArgs1;
+//
+// #define NUM_TRAILS_PER_THREAD_GROUP (GROUP_SIZE_0 / NUM_STAMPS_PER_TRAIL) // 256 / 16 = 16
+// #define NUM_TRAILS_PER_JUNCTION 3
+//
+// // Coordinates of each junction that links with trails
+// groupshared float2 LDS_JunctionCoords[NUM_TRAILS_PER_THREAD_GROUP];
+// groupshared float LDS_JunctionDepths[NUM_TRAILS_PER_THREAD_GROUP];
+//
+// #define INVALID_DEPTH (100000)
+// #define DEPTH_SMOOTH_ITERATION 2
+// #define DEPTH_AMPLIFIER 1.0
+//
+// // Atomic counters can only be of type uint
+// groupshared uint LDS_TrailAtomics[NUM_TRAILS_PER_THREAD_GROUP];
+// // Currently used to count actual length of each trail,
+// // though we have 16 threads for each trail,
+// // Not every trails is long enough to feed 16 threads(< 16 pixels);
+// //
+// // Trials shorter than 16pixel have extra stamp data chunks flagged with
+// // NULL pointer " TRAIL_TABLE_NULL_STAMP ".
+// // We use a 32bit bitwise counter for each trail,
+// // stamp#i at trail will vote its flag(is this stamp NULL or not) at ith bit.
+// //
+// // e.g: ------------------------------------------------------
+// // '-' means actual pixel on trail
+// // 'x' means null pixel pointer
+// //  1514131211109 8 7 6 5 4 3 2 1 0 Stamp Rank/Bit Field Index
+// //  x x x x x x x x x x x - - - - - Trail Layout
+// //  0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 Length Counter
+// // ------------------------------------------------------------
+// void VoteToLDSTrailLengthCounter(uint isValidSample, uint trailIdLocal, uint sampleIdLocal)
+// {
+// 	InterlockedOr(LDS_TrailAtomics[trailIdLocal], (isValidSample << sampleIdLocal));
+// }
+//
+// // Output parameters: 
+// // -------------------------------------------------------------------------------------
+// // [0] = Sum{ w^2 * arcLen^2 }
+// // [1] = Sum{ w^2 * arcLen^3 }
+// // [2] = Sum{ w^2 * arcLen^4 }
+// // [3] = Sum{ w^2 * arcLen^1 * (x_i - x_junction) }
+// // [4] = Sum{ w^2 * arcLen^2 * (x_i - x_junction) }
+// // [5] = Sum{ w^2 * arcLen^1 * (y_i - y_junction) }
+// // [6] = Sum{ w^2 * arcLen^2 * (y_i - y_junction) }
+// // [7] = Sum{ w^2 * arcLen^1 * (z_i - z_junction) }
+// // [8] = Sum{ w^2 * arcLen^2 * (z_i - z_junction) }
+// void StoreWLSParamToBuffer(float paramVal, uint trailId, uint paramId)
+// {
+// 	CBuffer_BufferRawStrokeData.Store(
+// 		CBuffer_StrokeData_WLSParams_AddrAt(trailId, paramId),
+// 		asuint(paramVal)
+// 	);
+// }
+//
+//
+// // Local shared memory for reduction, scan, data transfer
+// // ---------------------------------------------------------------
+// groupshared float LDS_LocalCache[GROUP_SIZE_0 * 3];
+//
+//
+// void ReductionX16(uint tid, float val)
+// {
+// 	LDS_LocalCache[tid] = val;
+// 	GroupMemoryBarrierWithGroupSync();
+//
+// 	[unroll]
+// 	for (uint s = 1; s < NUM_STAMPS_PER_TRAIL; s *= 2)
+// 	{
+// 		int index = 2 * s * tid;
+// 		if (index < GROUP_SIZE_0)
+// 		{
+// 			LDS_LocalCache[index] += LDS_LocalCache[index + s];
+// 		}
+// 		GroupMemoryBarrierWithGroupSync();
+// 	}
+// }
+//
+// void ReductionX16_Max(uint tid, float val)
+// {
+//     LDS_LocalCache[tid] = val;
+//     GroupMemoryBarrierWithGroupSync();
+//
+// 	[unroll]
+//     for (uint s = 1; s < NUM_STAMPS_PER_TRAIL; s *= 2)
+//     {
+//         int index = 2 * s * tid;
+//         if (index < GROUP_SIZE_0)
+//         {
+//             LDS_LocalCache[index] = 
+// 				max(LDS_LocalCache[index], LDS_LocalCache[index + s]);
+//         }
+//         GroupMemoryBarrierWithGroupSync();
+//     }
+// }
+//
+// void ScanX16(uint tid, float val)
+// {
+// 	LDS_LocalCache[tid] = val;
+// 	GroupMemoryBarrierWithGroupSync();
+//
+// 	const uint sampleId = tid % NUM_STAMPS_PER_TRAIL;
+// 	[unroll]
+// 	for (uint s = 1; s < NUM_STAMPS_PER_TRAIL; s <<= 1)
+// 	{
+// 		LDS_LocalCache[tid] += (s <= sampleId) ? LDS_LocalCache[tid - s] : 0;
+// 		GroupMemoryBarrierWithGroupSync();
+// 	}
+// }
+//
+// /**
+//  * \brief stamp in different position has adaptive kernel weights.
+//  * \param x stamp rank normalized to (0, 1) range
+//  * \return the impulse for depth smooth kernel
+//  */
+// float DepthSmoothImpulse(float x)
+// {
+//     return smoothstep(0, 0.446, x) - smoothstep(0.754, 1.37, x);
+// }
+//
+// static float2 DEPTH_SAMPLE_OFFSET[16] =
+// {
+//     float2(-2, 2), float2(0, 2), float2(2, 2),
+// 	float2(-1, 1), float2(0, 1), float2(1, 1),
+// 	float2(-2, 0), float2(-1, 0), float2(1, 0), float2(2, 0),
+// 	float2(-1, -1), float2(0, -1), float2(1, -1),
+// 	float2(-2, -2), float2(2, -2), float2(2, -2)
+// };
+//
+// float SmoothDepthX16(uint tid, float z, bool isValidSample)
+// {
+// 	LDS_LocalCache[tid] = z;
+// 	GroupMemoryBarrierWithGroupSync();
+//
+// 	const uint trailStart =
+// 		(tid / NUM_STAMPS_PER_TRAIL) // Trail ID
+// 		* NUM_STAMPS_PER_TRAIL; // Trail Size
+// 	float2 sampleOffsets = float2(
+// 		max(((float) (tid)) - 1.0, (float) trailStart),
+// 		min(tid + 1, trailStart + NUM_STAMPS_PER_TRAIL - 1)
+// 	); // Neighbor sample ids with range bounding
+//
+// 	float3 neighZ = 0;
+// 	// ----------------------------------------------------------
+// #define SAMPLE_NEIGHBOR_SAMPLES \
+//     neighZ.x = LDS_LocalCache[(uint) (sampleOffsets.x)]; \
+//     neighZ.z = LDS_LocalCache[(uint) (sampleOffsets.y)]; \
+//
+// #define SAMPLE_CENTER_SAMPLE \
+// 	neighZ.y = LDS_LocalCache[tid]; \
+// 	// ----------------------------------------------------------
+//
+// 	SAMPLE_NEIGHBOR_SAMPLES
+//     GroupMemoryBarrierWithGroupSync(); // Essential;
+// 	neighZ.y = z;
+//
+// 	// Stamps close to junction always have poor precision of depth
+// 	// So we tune down the kernel weight accordingly
+//     float rankNormalized = 
+// 		((float) (tid % NUM_STAMPS_PER_TRAIL)) // Sample ID
+// 		/ ((float) (NUM_STAMPS_PER_TRAIL)); // Total #Samples per trail
+//     float4 blurKernel = float4(1, DepthSmoothImpulse(rankNormalized), 1, 0.25);
+// 	blurKernel.x = (neighZ.x == INVALID_DEPTH) ? 0 : 1;
+// 	blurKernel.z = (neighZ.z == INVALID_DEPTH) ? 0 : 1;
+// 	blurKernel.xyz = (!isValidSample) ? float3(0, 1, 0) : blurKernel.xyz;
+// 	blurKernel.w = rcp(blurKernel.x + blurKernel.y + blurKernel.z);
+//
+// 	[unroll]
+// 	for (int i = 0; i < DEPTH_SMOOTH_ITERATION; ++i)
+// 	{
+// 		LDS_LocalCache[tid] = dot(neighZ, blurKernel.xyz) * blurKernel.w;
+// 		GroupMemoryBarrierWithGroupSync();
+// 		SAMPLE_NEIGHBOR_SAMPLES
+// 		SAMPLE_CENTER_SAMPLE
+// 	}
+//
+// 	return neighZ.y;
+// #undef SAMPLE_CENTER_SAMPLE
+// #undef SAMPLE_NEIGHBOR_SAMPLES
+// }
+//
+// #define FITTING_PARAMS_REDUCTION(paramId) \
+// ReductionX16(groupId, param); \
+// if (writerThread) \
+// { \
+// 	StoreWLSParamToBuffer(LDS_LocalCache[trailIdLocal * NUM_STAMPS_PER_TRAIL], trailIdGlobal, paramId); \
+// } \
+// GroupMemoryBarrierWithGroupSync(); \
+//
+//
+// // Thread Mapping:
+// // 0 - 15 16 - 31 ... 240 - 255 := Group Thread ID
+// //	 0		 1			  15	:= Trail ID
+// // 0 - 15 0 - 15  ...   0 - 15  := Sample ID
+// [numthreads(GROUP_SIZE_0,1,1)]
+// void StrokeFormation_CurveFitting
+// (
+// 	uint3 id : SV_DispatchThreadID,
+// 	uint groupId : SV_GroupIndex)
+// {
+// 	const uint trailIdGlobal = (id.x / NUM_STAMPS_PER_TRAIL);
+// 	const uint trailIdLocal = (groupId / NUM_STAMPS_PER_TRAIL);
+// 	const uint SampleId = (id.x % NUM_STAMPS_PER_TRAIL);
+// 	const uint TrailCount = CBuffer_CachedArgs_ScanCounter(1);
+//
+// 	const bool isRedundantThread = id.x >= (TrailCount * NUM_STAMPS_PER_TRAIL);
+//
+// 	// -----------------------------------------------------------------
+// 	// Load Junction Data (StampID, Coordinate, Depth)
+// 	// And Cache Junction position(Coord & Depth)
+// 	// -----------------------------------------------------------------
+//     float2 junctionCoord;
+//     float junctionDepth;
+// 	if (SampleId == 0)
+// 	{
+// 		// Stamp ID
+// 		uint junctionStampPtr =
+// 			CBuffer_BufferRawStrokeData.Load(
+// 				CBuffer_StrokeData_TrailHeader_AddrAt(trailIdGlobal));
+// 		// Cache Screen Coord
+//         junctionCoord = (float2) DecodePixelCoord(
+// 				CBuffer_BufferRawStampPixels.Load(
+// 					CBuffer_BufferRawStampPixels_AddrAt(junctionStampPtr)));
+//         LDS_JunctionCoords[trailIdLocal] = junctionCoord;
+//
+// 		// Cache View Space Depth
+// 		junctionDepth =
+// 			_CameraDepthTexture.SampleLevel(
+// 				sampler_linear_clamp,
+// 				junctionCoord * (_ScreenParams.zw - 1), 0
+// 			).r;
+//     }
+// 	
+// 	// --------------------------------------------------------------------------
+// 	// Load Sample Data Chunk
+// 	// --------------------------------------------------------------------------
+// 	bool isValidSample = false;
+// 	StampDataChunkRT sampleData = ExtractStampDataChunkRT(
+// 		CBuffer_BufferRawStrokeData.Load4(
+// 			CBuffer_StrokeData_TrailSample_AddrAt(trailIdGlobal, SampleId)),
+// 		// out: if this sample is valid
+// 		// (possibly we have empty stamp slots when stroke/trail too short)
+// 		isValidSample
+// 	);
+// 	isValidSample = isValidSample && (!isRedundantThread);
+//
+// 	// -------------------------------------------------------------------------------
+// 	// Compute Trail Length
+// 	// -------------------------------------------------------------------------------
+// 	if (SampleId == 0)
+// 	{
+// 		LDS_TrailAtomics[trailIdLocal] = 0; // clear all counters
+// 	}
+// 	GroupMemoryBarrierWithGroupSync();
+//
+// 	VoteToLDSTrailLengthCounter(isValidSample, trailIdLocal, SampleId);
+// 	GroupMemoryBarrierWithGroupSync();
+//
+// 	// first_bit_high returns -1 when all bits are 0
+// 	// so here we use int instead of uint
+// 	int trailLength = 1 + firstbithigh(LDS_TrailAtomics[trailIdLocal]);
+//     isValidSample = isValidSample && (trailLength != 0);
+// 	
+// 	// -------------------------------------------------------------------------------
+// 	// Estimate null stamp coordinates
+// 	// -------------------------------------------------------------------------------
+//     junctionCoord = LDS_JunctionCoords[trailIdLocal];
+// 	float2 estimateOffset = normalize(sampleData.coord - junctionCoord);
+//
+// #define PACK_COORD_TO_FLOAT(coord) (asfloat(PackPixelCoord((uint2) (coord))))
+// #define UNPACK_COORD_TO_FLOAT2(coord) ((float2) DecodePixelCoord(asuint((coord))))
+// 	
+//     if (SampleId == (uint) (trailLength - 1) && isValidSample)
+// 	{
+// 		// All null sample have the same depth as the last valid sample
+// 		// and moves along the direction from junction to last valid sample
+// 		LDS_LocalCache[4 * trailIdLocal] = estimateOffset.x;
+// 		LDS_LocalCache[4 * trailIdLocal + 1] = estimateOffset.y;
+//         LDS_LocalCache[4 * trailIdLocal + 2] = PACK_COORD_TO_FLOAT(sampleData.coord);
+// 		LDS_LocalCache[4 * trailIdLocal + 3] = sampleData.depth;
+//     }
+//
+// 	GroupMemoryBarrierWithGroupSync();
+//
+//     if ((!isValidSample) && (!isRedundantThread))
+// 	{
+// 		estimateOffset.x = LDS_LocalCache[4 * trailIdLocal];
+// 		estimateOffset.y = LDS_LocalCache[4 * trailIdLocal + 1];
+//         sampleData.coord = 
+// 			UNPACK_COORD_TO_FLOAT2(LDS_LocalCache[4 * trailIdLocal + 2])
+// 			 + estimateOffset * (SampleId - trailLength + 1);
+//
+//     	sampleData.depth = LDS_LocalCache[4 * trailIdLocal + 3];
+//     }
+// 	GroupMemoryBarrierWithGroupSync();
+//
+// 	
+// 	
+// #ifdef DEBUG_SAMPLE_DEPTH
+//     float depth_prev = sampleData.depth;
+// #endif
+//
+// 	
+// 	// -------------------------------------------------------------------------------
+// 	// Sample Depth Smoothing & Amplifying
+// 	// -------------------------------------------------------------------------------
+//     // sampleData.depth = isValidSample ? sampleData.depth : INVALID_DEPTH;
+//     sampleData.depth = DEPTH_AMPLIFIER * SmoothDepthX16(groupId, sampleData.depth, true);
+//     // Amplify Z-impact on curve fitting
+//
+//     GroupMemoryBarrierWithGroupSync();
+// 	
+// 	// Sample Junction Depth
+//     float2 sampleCoord =
+// 		(junctionCoord + DEPTH_SAMPLE_OFFSET[SampleId]);
+// 	
+//     float offsetZ = _CameraDepthTexture.SampleLevel(
+// 				sampler_linear_clamp,
+// 				sampleCoord * (_ScreenParams.zw - 1), 0
+// 			).r;
+//     offsetZ = isRedundantThread ? 0 : offsetZ;
+//
+// 	ReductionX16_Max(groupId, offsetZ);
+//
+//     if (SampleId == 0)
+//     {
+//         float junctionZ = max(
+// 			junctionDepth,
+// 			LDS_LocalCache[trailIdLocal * NUM_STAMPS_PER_TRAIL]
+// 		);
+//         junctionZ = DEPTH_AMPLIFIER *
+// 			(-1.0) * LinearEyeDepth(
+// 				junctionZ,
+// 				_ZBufferParams
+// 			);
+//         LDS_JunctionDepths[trailIdLocal] = junctionZ;
+//
+//     	
+// #ifdef DEBUG_SAMPLE_DEPTH
+//         _DebugTexture[junctionCoord] = float4(-1.0 * junctionZ.xx, 0, 1);
+// #endif
+//
+//     }
+// 	
+//     GroupMemoryBarrierWithGroupSync();
+//
+// 	
+// 	// ---------------------------------------------------------------------------
+// 	// Compute Fitting Parameters
+// 	// ---------------------------------------------------------------------------
+// 	// Fetch Prev Sample View-Z -------------------------------
+// 	LDS_LocalCache[groupId] = sampleData.depth;
+// 	GroupMemoryBarrierWithGroupSync();
+// 	junctionDepth = LDS_JunctionDepths[trailIdLocal];
+// 	float prevSampleDepth =
+// 		(SampleId == 0) ? junctionDepth : LDS_LocalCache[groupId - 1];
+//
+// 	GroupMemoryBarrierWithGroupSync();
+//
+// #ifdef DEBUG_SAMPLE_DEPTH
+//     _DebugTexture[sampleData.coord] = float4(-1.0 * sampleData.depth, -1.0 * prevSampleDepth, 0, 1);
+// #endif
+//
+// 	
+// 	// Fetch Prev Sample Coord --------------------------------
+//     LDS_LocalCache[groupId] = PACK_COORD_TO_FLOAT(sampleData.coord);
+// 	GroupMemoryBarrierWithGroupSync();
+//     float2 prevSampleCoord =
+// 		(SampleId == 0)
+// 			? junctionCoord
+// 			: (UNPACK_COORD_TO_FLOAT2(LDS_LocalCache[groupId - 1]));
+//
+// 	// Compute torsion ----------------------------------------
+//     float2 nextSampleCoord =
+// 		(SampleId == NUM_STAMPS_PER_TRAIL - 1)
+// 			? sampleData.coord
+// 			: (UNPACK_COORD_TO_FLOAT2(LDS_LocalCache[groupId + 1]));
+// 	float torsion =
+// 		.5 * (
+// 			dot(sampleData.tangent, sampleData.coord - prevSampleCoord)
+// 			+ dot(sampleData.tangent, nextSampleCoord - sampleData.coord)
+// 		);
+// 	
+// 	// Compute Estimated Arc-Length ---------------------------
+// 	float dl = length(
+// 		float3(sampleData.coord, sampleData.depth) -
+// 		float3(prevSampleCoord, prevSampleDepth)
+// 	);
+//     GroupMemoryBarrierWithGroupSync();
+// 	ScanX16(groupId, dl); // Segmented scan of fixed length 16
+//
+// 	
+// 	float l = LDS_LocalCache[groupId];
+// 	float w = FittingWeight(l);
+//     w *= w;
+//
+//
+// #ifdef DEBUG_KERNEL_0
+//     _DebugTexture[sampleData.coord] = float4(l, sampleData.depth, prevSampleDepth, dl);
+// #endif
+//
+// 	
+// 	// Compute fitting parameters ----------------------
+// 	float param = 0;
+// 	const bool writerThread = (!isRedundantThread) && (SampleId == 0);
+//
+//     GroupMemoryBarrierWithGroupSync();
+// 	
+// 	// param 'a1'
+// 	param = w * l * l;
+// 	FITTING_PARAMS_REDUCTION(0);
+//
+// 	// param 'a2'
+// 	param *= (0.5 * l);
+// 	FITTING_PARAMS_REDUCTION(1);
+//
+// 	// param 'a3'
+// 	param *= (0.5 * l);
+// 	FITTING_PARAMS_REDUCTION(2);
+//
+// 	// param 'b_x1'
+// 	param = w * l * (sampleData.coord.x - junctionCoord.x);
+// 	FITTING_PARAMS_REDUCTION(3);
+//
+// 	// param 'b_x2'
+// 	param *= (0.5 * l);
+// 	FITTING_PARAMS_REDUCTION(4);
+//
+// 	// param 'b_y1'
+// 	param = w * l * (sampleData.coord.y - junctionCoord.y);
+// 	FITTING_PARAMS_REDUCTION(5);
+//
+// 	// param 'b_y2'
+// 	param *= (0.5 * l);
+// 	FITTING_PARAMS_REDUCTION(6);
+//
+// 	// param 'b_z1'
+// 	param = w * l * (sampleData.depth - junctionDepth);
+// 	FITTING_PARAMS_REDUCTION(7);
+//
+// 	// param 'b_z2'
+// 	param *= (0.5 * l);
+// 	FITTING_PARAMS_REDUCTION(8);
+//
+// 	// param 'torsion'
+//     param = torsion;
+// 	FITTING_PARAMS_REDUCTION(9);
+// 	
+// 	if (id.x == 0)
+// 	{
+// 		// Till now,
+// 		// scan-counter#0 stores total junction count
+// 		// scan-counter#1 stores total stroke count
+// 		// this kernel is dispatched by indirect args buffer #1
+// 		uint workSize = CBuffer_CachedArgs_ScanCounter(0) * NUM_TRAILS_PER_JUNCTION;
+// 		CBuffer_DispatchIndirectArgs[0] =
+// 			ComputeNumGroups(workSize, GROUP_SIZE_0, BITS_GROUP_SIZE_0);
+// 	} 
+// }
+//
+// #define NUM_JUNCTIONS_PER_GROUP_1 ((GROUP_SIZE_1 / NUM_CONNECTIONS_PER_JUNCTION))
+// #define NUM_CONNECTIONS_PER_JUNCTION 3
+// #define NUM_CONNECTIONS_PER_GROUP_1 (NUM_CONNECTIONS_PER_JUNCTION * NUM_JUNCTIONS_PER_GROUP_1)
+//
+//
+// struct TrailParams
+// {
+// 	float4x2 d0;
+// 	float2 d1;
+// };
+//
+//
+// #define PARAM_BLOCK_0(params) (params.d0._11_21_31_41)
+// #define PARAM_BLOCK_1(params) (params.d0._12_22_32_42)
+// #define PARAM_8_9(params) (params.d1)
+//
+// // Connect 2 trails on 2 side of the same junction
+// // to form complete parameters for fitting a curv path
+// TrailParams Connect(TrailParams tp0, TrailParams tp1)
+// {
+// 	// A1 (trailParams.d0._11)
+// 	// A2 (trailParams.d0._21)
+// 	// A3 (trailParams.d0._31)
+// 	// BX1 (trailParams.d0._41)
+// 	// BX2 (trailParams.d0._12)
+// 	// BY1 (trailParams.d0._22)
+// 	// BY2 (trailParams.d0._32)
+// 	// BZ1 (trailParams.d0._42)
+// 	// BZ2 (trailParams.d1)
+// 	// --------------------------------------------
+// 	// Several terms with odd power index
+//     tp1.d0._21 *= -1; // A2, l^3
+//     tp1.d0._41 *= -1; // BX1, l
+//     tp1.d0._22 *= -1; // BY1, l
+//     tp1.d0._42 *= -1; // BZ1, l
+//
+// 	tp0.d0 += tp1.d0;
+// 	tp0.d1 += tp1.d1;
+//
+// 	return tp0;
+// } 
+//
+// groupshared TrailParams LDS_ParamCache[GROUP_SIZE_1];
+// groupshared float LDS_Curvatures[GROUP_SIZE_1];
+// groupshared uint LDS_StampIDs[GROUP_SIZE_1];
+// groupshared bool LDS_JunctionValidationFlags[NUM_JUNCTIONS_PER_GROUP_1];
+//
+// uint NextTrailIdLocal(uint trailIdLocal)
+// {
+// 	return
+// 		(trailIdLocal / NUM_TRAILS_PER_JUNCTION) * NUM_TRAILS_PER_JUNCTION
+// 		+ ((trailIdLocal + 1) % NUM_TRAILS_PER_JUNCTION);
+// }
+//
+// // Thread Mapping:
+// // 1. We assume that each junction has at most 3 connected junction-ends
+// //	(though a junction might have 4 junction-ends, but it rarely happens)
+// //
+// // 2. 3 consecutive thread Ti, Ti+1, Ti+2 serves for the same one junction J,
+// //	each thread fetches 1 of 3 junction-end samples S0, S1, S2 around the junction.
+// //	and computes the curvature at junction along the path
+// //  Ti-J-Ti+1, Ti+1-J-Ti+2, Ti+2-J-Ti
+// //  (here we call these possible paths as "connection"s)
+// //  
+// // 3. Note that GROUP_SIZE_1 cannot be divided perfectly by 3,
+// //	so be aware of the junction id of each thread,
+// //	it should be like this:
+// // const uint JunctionIdGlobal =
+// // 		(gId.x * NUM_CONNECTIONS_PER_GROUP_1 + groupId) / NUM_CONNECTIONS_PER_JUNCTION;
+// [numthreads(GROUP_SIZE_1, 1, 1)]
+// void StrokeFormation_ReConnection
+// (
+// 	uint3 id : SV_DispatchThreadID,
+// 	uint groupId : SV_GroupIndex,
+// 	uint3 gId : SV_GroupID)
+// {
+// 	const uint JunctionIdGlobal = 
+// 		(gId.x * NUM_CONNECTIONS_PER_GROUP_1 + groupId) / NUM_CONNECTIONS_PER_JUNCTION;
+// 	const uint JunctionIdLocal = groupId.x / NUM_TRAILS_PER_JUNCTION;
+//     const uint junctionStampID = CBuffer_BufferRawStrokeData.Load(
+// 		CBuffer_StrokeData_JunctionTable_JunctionPtr_AddrAt(JunctionIdGlobal)
+// 	);
+// 	const uint TrailIdLocal = groupId;
+//     const uint nextTrailIdLocal = NextTrailIdLocal(TrailIdLocal);
+//     const uint JunctionCount = CBuffer_CachedArgs_ScanCounter(0);
+// 	bool isValidThread =
+// 		(groupId < NUM_CONNECTIONS_PER_GROUP_1) &&
+// 		(JunctionIdGlobal < JunctionCount);
+//
+// 	// ---------------------------------------------------------------------------
+// 	// Load Junction-End Stamp IDs
+// 	// ---------------------------------------------------------------------------
+// 	// Load 1-3 slots
+// 	uint trailStampID =
+// 		CBuffer_BufferRawStrokeData.Load(
+// 			CBuffer_StrokeData_JunctionTable_JunctionEnd_AddrAt(
+// 				JunctionIdGlobal,
+// 				TrailIdLocal % NUM_TRAILS_PER_JUNCTION
+// 			)
+// 		);
+//     const bool isNullStamp = (trailStampID == TRAIL_TABLE_NULL_STAMP);
+// 	// If current slot is an empty slot:
+// 	// (In normal configuration, the other 2 threads must have got valid ones)
+// 	// --- load 4th slot instead
+// 	uint trailStampId_4th = CBuffer_BufferRawStrokeData.Load(
+// 		CBuffer_StrokeData_JunctionTable_JunctionEnd_AddrAt(JunctionIdGlobal, 3)
+// 	);
+// 	
+// 	trailStampID =
+// 		(isNullStamp) ? trailStampId_4th : trailStampID;
+//
+// 	// Count total null stamps around this junction
+// 	// Some junctions have <3 junction-end stamps because
+// 	// they are adjacent to other junctions,
+// 	// We don't do anything to these junctions otherwise
+// 	// topology will be destroyed
+//     LDS_StampIDs[groupId] = 0; // This LDS is used as counter array, for now
+//     GroupMemoryBarrierWithGroupSync();
+//
+// 	if (isValidThread)
+// 	{
+//         InterlockedAdd(
+// 	        LDS_StampIDs[JunctionIdLocal * NUM_TRAILS_PER_JUNCTION],
+// 	        (uint)isNullStamp);
+//     }
+// 	GroupMemoryBarrierWithGroupSync();
+//
+//     uint numNullStamps = 
+// 		(uint) (trailStampId_4th == TRAIL_TABLE_NULL_STAMP) + // 4th stamp
+// 		LDS_StampIDs[JunctionIdLocal * NUM_TRAILS_PER_JUNCTION]; // 1-3th stamps
+// 	isValidThread = (isValidThread && (numNullStamps == 1)); // TODO: connect 4-connected junctions?
+//
+//     if (TrailIdLocal % NUM_TRAILS_PER_JUNCTION == 0 && 
+// 		JunctionIdLocal < NUM_JUNCTIONS_PER_GROUP_1)
+//     {
+// 		LDS_JunctionValidationFlags[JunctionIdLocal] = 
+// 			(numNullStamps == 1) && (JunctionIdGlobal < JunctionCount);
+//     }
+// 	GroupMemoryBarrierWithGroupSync();
+//
+// 	
+// 	// True usage of LDS_StampIDs:
+// 	// --- Cache stamp id
+// 	LDS_StampIDs[groupId] = trailStampID;
+//
+//     const uint trailStampFlag = CBuffer_BufferRawFlagsPerStamp.Load(
+// 				CBuffer_BufferRaw_FlagsPerStamp_AddrAt(trailStampID)
+// 			);
+// 	uint TrailStrokeIdGlobal = StampFlag_GetStrokeHandleID(trailStampFlag);
+//
+// 	
+// 	// ---------------------------------------------------------------------------
+// 	// Load Fitting Parameters Aggregated Along this Trail
+// 	// ---------------------------------------------------------------------------
+// 	TrailParams trailParams;
+// 	PARAM_BLOCK_0(trailParams) =
+// 		asfloat(CBuffer_BufferRawStrokeData.Load4(
+// 			CBuffer_StrokeData_WLSParams_AddrAt(TrailStrokeIdGlobal, 0))).xyzw;
+// 	PARAM_BLOCK_1(trailParams) =
+// 		asfloat(CBuffer_BufferRawStrokeData.Load4(
+// 			CBuffer_StrokeData_WLSParams_AddrAt(TrailStrokeIdGlobal, 4))).xyzw;
+// 	PARAM_8_9(trailParams) =
+// 		asfloat(CBuffer_BufferRawStrokeData.Load2(
+// 			CBuffer_StrokeData_WLSParams_AddrAt(TrailStrokeIdGlobal, 8))).xy;
+// 	LDS_ParamCache[TrailIdLocal] = trailParams;
+//
+// 	GroupMemoryBarrierWithGroupSync();
+//
+// 	// Connect parameters on 2 trails on 2 sides of junction
+// 	trailParams = Connect(trailParams, LDS_ParamCache[nextTrailIdLocal]);
+//
+// 	// Shortcuts ---------------------------------
+// #define A1 ((trailParams.d0._11))
+// #define A2 ((trailParams.d0._21))
+// #define A3 ((trailParams.d0._31))
+// #define BX1 ((trailParams.d0._41))
+// #define BX2 ((trailParams.d0._12))
+// #define BY1 ((trailParams.d0._22))
+// #define BY2 ((trailParams.d0._32))
+// #define BZ1 ((trailParams.d0._42))
+// #define BZ2 ((trailParams.d1.x))
+//
+// #define _A1(params) (params.d0._11)
+// #define _A2(params) (params.d0._21)
+// #define _A3(params) (params.d0._31)
+// #define _BX1(params) (params.d0._41)
+// #define _BX2(params) (params.d0._12)
+// #define _BY1(params) (params.d0._22)
+// #define _BY2(params) (params.d0._32)
+// #define _BZ1(params) (params.d0._42)
+// #define _BZ2(params) (params.d1.x) 
+// #define _TORSION(params) (params.d1.y)
+// 	// --------------------------------------------
+//
+// 	// ---------------------------------------------------------------------------
+// 	// Compute Curvature at Junction by Weighted-Least-Square
+// 	// ---------------------------------------------------------------------------
+// 	float dInv = rcp((A1 * A3) - (A2 * A2));
+// 	float3 dr = float3(
+// 		(A3 * BX1) - (A2 * BX2),
+// 		(A3 * BY1) - (A2 * BY2),
+// 		(A3 * BZ1) - (A2 * BZ2)
+// 	);
+// 	dr *= dInv;
+//
+// 	float3 ddr = float3(
+// 		(A1 * BX2) - (A2 * BX1),
+// 		(A1 * BY2) - (A2 * BY1),
+// 		(A1 * BZ2) - (A2 * BZ1)
+// 	);
+// 	ddr *= dInv;
+//
+// 	float len_dr = length(dr);
+// 	float curv = isValidThread
+// 		             ? length(cross(dr, ddr)) / (len_dr * len_dr * len_dr)
+// 		             : 10000; // Max curv to protect valid values
+// 	curv = abs(curv);
+//
+// 	LDS_Curvatures[groupId] = curv;
+// 	GroupMemoryBarrierWithGroupSync();
+//
+// #ifdef DEBUG_KERNEL_1 // ------------------------------------------------------
+//
+// 	uint junctionStampId_Dbg = CBuffer_BufferRawStrokeData.Load(
+// 		CBuffer_StrokeData_JunctionTable_JunctionPtr_AddrAt(JunctionIdGlobal)
+// 	);
+// 	int2 coord =
+// 		(int2)DecodePixelCoord(
+// 			CBuffer_BufferRawStampPixels.Load(
+// 				CBuffer_BufferRawStampPixels_AddrAt(junctionStampId_Dbg)));
+//     if ((groupId < NUM_CONNECTIONS_PER_GROUP_1) &&
+// 		(JunctionIdGlobal < JunctionCount))
+// 	{
+//         _DebugTexture[coord] = float4(0, junctionStampId_Dbg, 0, 1);
+//     }
+//
+// #endif
+//
+//
+// 	// ---------------------------------------------------------------------------
+// 	// Pick Smallest Curvature
+// 	// ---------------------------------------------------------------------------
+//     uint bestConnectionId = 0;
+//     const uint jidLocal = groupId;
+//     const uint jidGlobal = (gId.x * NUM_JUNCTIONS_PER_GROUP_1 + jidLocal);
+//     bool validJunction = false;
+// 	[branch]
+// 	if (groupId < NUM_JUNCTIONS_PER_GROUP_1)
+//     {
+//         validJunction = LDS_JunctionValidationFlags[jidLocal];
+// 		
+//         uint baseOffset = jidLocal * NUM_CONNECTIONS_PER_JUNCTION;
+//         float connectionCurvVals[3] =
+//         {
+//             LDS_Curvatures[baseOffset],
+// 			LDS_Curvatures[baseOffset + 1],
+// 			LDS_Curvatures[baseOffset + 2]
+//         };
+// 		
+//         bestConnectionId = 2;
+//         bestConnectionId =
+// 			connectionCurvVals[1] < connectionCurvVals[bestConnectionId]
+// 				? 1 : bestConnectionId;
+//         bestConnectionId =
+// 			connectionCurvVals[0] < connectionCurvVals[bestConnectionId]
+// 				? 0 : bestConnectionId;
+//         bestConnectionId += baseOffset;
+//
+//         if (validJunction)
+//         {
+// 	        LDS_Curvatures[baseOffset] = (float)bestConnectionId; // cache here
+//         }
+//     }
+//
+// 	GroupMemoryBarrierWithGroupSync();
+//
+// 	// ------------------------------------------------------------------------
+// 	// Update Junction Linkage & Stamp Flag
+// 	// ------------------------------------------------------------------------
+// 	// TODO: when curvature is too large don't connect any path
+// 	[branch]
+// 	if (groupId < NUM_JUNCTIONS_PER_GROUP_1)
+// 	{
+// 		// Linkage
+// 		// --------------------------------------------------------------------
+// 		uint2 trailStampIds = uint2(
+// 			LDS_StampIDs[bestConnectionId],
+// 			LDS_StampIDs[NextTrailIdLocal(bestConnectionId)]
+// 		);
+//
+//         const uint jStampId = CBuffer_BufferRawStrokeData.Load(
+// 			CBuffer_StrokeData_JunctionTable_JunctionPtr_AddrAt(jidGlobal)
+// 		);
+//
+//         // Update linkage on junction:
+//         // Connect junction with best matches(this stamp, next stamp)
+//         uint rwAddr = CBuffer_BufferRawStampLinkage_AddrAt(
+// 	        ORIGINAL_STAMP_LINKAGE, jStampId
+// 		);
+//
+// 		LinkDataRT junctionLinkage =
+// 	        ExtractLinkage(CBuffer_BufferRawStampLinkage.Load4(rwAddr));
+//         junctionLinkage.link0 = trailStampIds.x;
+//         junctionLinkage.rank0 = 1;
+//         junctionLinkage.link1 = trailStampIds.y;
+//         junctionLinkage.rank1 = 1;
+//
+//         rwAddr = CBuffer_BufferRawStampLinkage_AddrAt(
+// 	        PINGPONG_STAMP_LINKAGE_1, jStampId
+// 		);
+//         if (validJunction)
+// 		{
+// 			CBuffer_BufferRawStampLinkage.Store4(rwAddr, PackLinkageRT(junctionLinkage));
+//         }
+//
+//         // Flag
+// 		// ------------------------------------------------------------------------
+//         rwAddr = CBuffer_BufferRaw_FlagsPerStamp_AddrAt(jStampId);
+//         uint stampFlag = CBuffer_BufferRawFlagsPerStamp.Load(rwAddr);
+//
+//         stampFlag = StampFlag_SetTopo(stampFlag, TYPE_CURVE);
+//
+//         rwAddr = CBuffer_BufferRaw_FlagsPerStamp_AddrAt(jStampId);
+// 		if (validJunction)
+// 		{
+// 			CBuffer_BufferRawFlagsPerStamp.Store(rwAddr, stampFlag);
+//         }
+// 		
+// 		
+// #ifdef DEBUG_KERNEL_1 // ------------------------------------------------------
+//         coord =
+// 	        (int2)DecodePixelCoord(
+// 		        CBuffer_BufferRawStampPixels.Load(
+// 			        CBuffer_BufferRawStampPixels_AddrAt(jStampId)));
+//         if ((groupId < NUM_CONNECTIONS_PER_GROUP_1) &&
+// 	        (JunctionIdGlobal < JunctionCount))
+//         {
+//             _DebugTexture[coord] = float4(junctionLinkage.link0, junctionLinkage.link1, 0, 1);
+//         }
+// #endif
+//
+// 		
+//     }
+//
+//
+// 	uint2 connectedTrails; // Local trail ids along the best connection
+// 	connectedTrails.x = (uint) LDS_Curvatures[JunctionIdLocal * NUM_TRAILS_PER_JUNCTION];
+// 	connectedTrails.y = NextTrailIdLocal(connectedTrails.x);
+//     bool isIsolated = 
+// 		(TrailIdLocal != connectedTrails.x) && 
+// 		(TrailIdLocal != connectedTrails.y);
+//
+//
+// 	// ------------------------------------------------------------------------
+// 	// Update junction-end(trail) stamp linkage & flag
+// 	// ------------------------------------------------------------------------
+// 	
+// 	uint4 trailLinkage = 
+// 		CBuffer_BufferRawStampLinkage.Load4(
+// 		    CBuffer_BufferRawStampLinkage_AddrAt(
+// 			    ORIGINAL_STAMP_LINKAGE, 
+// 				trailStampID));
+// 	
+//     uint junctionLinkSlot = 
+// 		(GET_STAMP_LINK_0(trailLinkage) == junctionStampID) ? 0 : 1;
+//     uint2 linkUpdate = EncodeStampLinkageSlot(
+// 		isIsolated ? trailStampID : junctionStampID,
+// 		isIsolated ? 0 : 1,
+// 	junctionLinkSlot == 0 ? GET_STAMP_MAX_ID(trailLinkage): 0
+// 	); // For now, only slot#0 encodes with extra info - Max ID
+//
+// 	if (isValidThread)
+// 	{
+// 		CBuffer_BufferRawStampLinkage.Store2(
+// 			CBuffer_BufferRawStampLinkageSlot_AddrAt(
+// 				PINGPONG_STAMP_LINKAGE_1,
+// 				trailStampID,
+// 				junctionLinkSlot),
+// 			linkUpdate
+// 		);
+// 	}
+//  
+//
+// 	
+// 	// ------------------------------------------------------------------------
+// 	// Update Junction-End(Trail) Stamp Flag
+// 	// ------------------------------------------------------------------------
+//     uint rwAddr = CBuffer_BufferRaw_FlagsPerStamp_AddrAt(junctionLinkSlot, trailStampID);
+//     uint stampFlag = trailStampFlag;
+//
+//     stampFlag = StampFlag_SetTopo(stampFlag, isIsolated ? TYPE_LINEEND_0 : TYPE_CURVE);
+//
+//     rwAddr = CBuffer_BufferRaw_FlagsPerStamp_AddrAt(junctionLinkSlot, trailStampID);
+// 	if (isValidThread)
+// 	{
+// 		CBuffer_BufferRawFlagsPerStamp.Store(rwAddr, stampFlag);
+//     }
+//
+// 	
+// #ifdef DEBUG_KERNEL_1
+// 	bool isConnected = (isValidThread) &&
+// 		(groupId == connectedTrails.x || groupId == connectedTrails.y);
+// 	coord =
+// 		(int2)DecodePixelCoord(
+// 			CBuffer_BufferRawStampPixels.Load(
+// 				CBuffer_BufferRawStampPixels_AddrAt(trailStampID)));
+// 	if (isValidThread)
+// 	{
+//         _DebugTexture[coord] = float4(
+// 			trailStampID, _TORSION(trailParams), curv, isConnected);
+//     }
+// #endif
+//
+// 	
+//     if (id.x == 0)
+//     {
+// 		// Till now,
+// 		// scan-counter#0 stores total junction count
+// 		// scan-counter#1 stores total stroke count
+// 		// this kernel is dispatched by indirect args buffer #0
+//         uint workSize = CBuffer_CachedArgs_PixelCounter;
+//         CBuffer_DispatchIndirectArgs1[0] =
+// 			ComputeNumGroups(workSize, GROUP_SIZE_2, BITS_GROUP_SIZE_2);
+//     }
+// }
+//
+// [numthreads(GROUP_SIZE_2, 1, 1)]
+// void StrokeFormation_UpdateLinkage
+// (
+// 	uint3 id : SV_DispatchThreadID)
+// {
+//     const uint StampId = id.x;
+//     const uint StampCount = CBuffer_CachedArgs_PixelCounter;
+//     const bool isValidThread = id.x < StampCount;
+//
+// 	if (isValidThread)
+// 	{
+// 		uint4 updatedLinkage =
+// 			CBuffer_BufferRawStampLinkage.Load4(
+// 				CBuffer_BufferRawStampLinkage_AddrAt(PINGPONG_STAMP_LINKAGE_1, StampId)
+// 			);
+// 		CBuffer_BufferRawStampLinkage.Store4(
+// 			CBuffer_BufferRawStampLinkage_AddrAt(PINGPONG_STAMP_LINKAGE_0, StampId),
+// 			updatedLinkage
+// 		);
+//
+// 		uint2 stampFlags = uint2(
+// 			CBuffer_BufferRawFlagsPerStamp.Load(
+// 				CBuffer_BufferRaw_FlagsPerStamp_AddrAt(0, StampId)
+// 			),
+// 			CBuffer_BufferRawFlagsPerStamp.Load(
+// 				CBuffer_BufferRaw_FlagsPerStamp_AddrAt(1, StampId)
+// 			)
+// 		);
+//        
+//
+// 		// Here are some utterly ugly code,
+// 		// YES I SUCK, BUT THIS SHIT JUST WORKS
+//         const bool conflictTopoAtSameStamp =
+// 			(
+// 				IS_CURVE_PIXEL(StampFlag_Topology(stampFlags.x)) &&
+// 				IS_LINEEND_PIXEL(StampFlag_Topology(stampFlags.y)))
+// 			||
+// 			(
+// 				IS_CURVE_PIXEL(StampFlag_Topology(stampFlags.y)) &&
+// 				IS_LINEEND_PIXEL(StampFlag_Topology(stampFlags.x))
+// 			);
+//         uint subbuffToUpdate =
+// 			(
+// 				conflictTopoAtSameStamp && 
+// 				IS_CURVE_PIXEL(StampFlag_Topology(stampFlags.x))
+// 			) ? 0 : 1;
+//
+// 		uint flagToUpdate =
+// 		(
+// 			conflictTopoAtSameStamp &&
+// 			subbuffToUpdate == 0
+// 		) ? stampFlags.y : stampFlags.x;
+//
+//         const bool conflictTopoFromJunction =
+// 		(
+// 			IS_CURVE_PIXEL(StampFlag_Topology(stampFlags.x)) &&
+// 			IS_JUNCTION_END_PIXEL(StampFlag_Topology(stampFlags.y))
+// 		);
+// 		subbuffToUpdate = conflictTopoFromJunction ? 1 : subbuffToUpdate;
+// 		flagToUpdate = conflictTopoFromJunction ? stampFlags.x : flagToUpdate;
+//
+//
+// 		
+// 		if (conflictTopoAtSameStamp || conflictTopoFromJunction)
+// 		{
+//             CBuffer_BufferRawFlagsPerStamp.Store(
+// 				CBuffer_BufferRaw_FlagsPerStamp_AddrAt(subbuffToUpdate, StampId),
+// 				flagToUpdate
+// 			);
+//         }
+//     }
+//
+// 	if (id.x == 0)
+// 	{
+// 		// Set New Indirect Dispatch Args for Later Scan Pass
+// 		// -------------------------------------------------------------------------
+// 		// Each thread processes X2 stamps
+//         uint workSize = (StampCount + 1) >> 1;
+//         uint numGroups =
+// 			ComputeNumGroups(workSize, GROUP_SIZE_2, BITS_GROUP_SIZE_2);
+//         CBuffer_DispatchIndirectArgs[0] = numGroups;
+//     }
+// }

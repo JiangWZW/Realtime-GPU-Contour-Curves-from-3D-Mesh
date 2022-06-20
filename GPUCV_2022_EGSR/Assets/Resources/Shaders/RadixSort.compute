@@ -1,0 +1,169 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel RadixSort_ClearGlobalHistogram
+#pragma kernel RadixSort_BuildGlobalHistogram
+// #pragma kernel RadixSort_SweepPhase
+
+#include "../ShaderLibrary/ComputeKernelConfigs/RadixSortComputeDefs.hlsl"
+ 
+StructuredBuffer<uint> CBuffer_StructuredKeyValuePairs;
+// Thread Mapping Details for StructuredKeyValuePairs:
+// ===================================================
+//      (1 Code Compression & Thread Mapping
+// Each 32-bit morton code is sliced into 4 digits
+// Compressed Morton Code Slices   | Digit level
+// [-- -- -- --] ... [-- -- ** **] |    00-07  
+// [-- -- -- --] ... [-- -- ** **] |    08-15 
+// [-- -- -- --] ... [-- -- ** **] |    16-23
+// [-- -- -- --] ... [-- -- ** **] |    24-31
+//      T0 ... ... ... ...Tk  | Thread Mapping
+// As you can see, each thread processes,
+// (4 digit level)(1 item/digit level)(4 slices/item)
+// => = 16 morton slices; ......(*1)
+//         (2 Trash Data Handling
+// What's more, there can be some trash data
+// (encoded as 0xffff, shown as '**'s above)
+// which needs to be handled later
+//         (3 Dispatch Scale
+// Each digit level have totally 
+// (#ViewEdges x 2) x 4 valid morton slices ......(*2)
+// Each thread processes 4x4 = 16 morton slices
+
+RWStructuredBuffer<uint> CBuffer_StructuredGlobalDigitStart;
+groupshared uint LDS_Histogram[4][256];
+// Thread Mapping Details for Shared Mem Histogram:
+// ===================================================
+// Each 32-bit morton code is sliced into 4 digits
+// So each digit has 8 bits => 256 different values;
+// That is, we need 4 * 256 slots in histogram in total;
+// |     | 0    | 1    | 2    | 3    |\--- DigitLevel
+// |-----+------+------+------+------|
+// | 0   | T0   | T0   | T0   | T0   |
+// | 1   | T0   | T0   | T0   | T0   |
+// | 2   | T1   | T1   | T1   | T1   |
+// | 3   | T1   | T1   | T1   | T1   |
+// | ... | ..   | ..   | ..   | ..   |
+// | ... | ..   | ..   | ..   | ..   |
+// | 254 | T127 | T127 | T127 | T127 |
+// | 255 | T127 | T127 | T127 | T127 |
+//    |
+//    |
+// DigitVal
+// Each thread processes 2x4 = 8 histogram bins
+
+RWStructuredBuffer<uint>    CBuffer_CachedArgs;
+RWStructuredBuffer<uint>    CBuffer_CachedArgs1;
+
+RWStructuredBuffer<int>     CBuffer_DispatchIndirectArgs;
+RWStructuredBuffer<int>     CBuffer_DispatchIndirectArgs1;
+
+[numthreads(256, 1, 1)]
+void RadixSort_ClearGlobalHistogram (
+    uint3 id : SV_DispatchThreadID,
+    uint groupIdx : SV_GroupIndex,
+    uint3 gIdx : SV_GroupID)
+{
+    CBuffer_StructuredGlobalDigitStart[id.x] = 0; // Clear digit counter
+    if (id.x == 0){
+        // the thread count can be computed as
+        // ceil((#ViewEdges X 2) / 4)
+        uint workSize = (CBuffer_CachedArgs_ViewEdgeCounter * 2 + 3) / 4;
+        uint numGroups = ComputeNumGroups(
+            workSize, GROUP_SIZE_1, BITS_GROUP_SIZE_1);
+
+        CBuffer_DispatchIndirectArgs1[0] = numGroups;
+
+        CBuffer_CachedArgs_NumGroups(0) = numGroups;
+        CBuffer_CachedArgs_NumGroups(1) = 0;
+    }
+}
+
+void CountDigitsInSharedMem(uint digitLevel, uint code)
+{
+    uint mask = (1 << BITS_PER_DIGIT) - 1; // 0x0000 00ff
+
+    InterlockedAdd(LDS_Histogram[digitLevel][code & mask], 1);
+    code >>= BITS_PER_DIGIT;
+    InterlockedAdd(LDS_Histogram[digitLevel][code & mask], 1);
+    code >>= BITS_PER_DIGIT;
+    InterlockedAdd(LDS_Histogram[digitLevel][code & mask], 1);
+    code >>= BITS_PER_DIGIT;
+    InterlockedAdd(LDS_Histogram[digitLevel][code & mask], 1);
+}
+
+void CountDigitsInGlobalMem(uint digitLevel, uint digit){
+    InterlockedAdd(
+        CBuffer_StructuredGlobalDigitStart[ADDR_OF_DIGIT(digitLevel, digit)], 
+        LDS_Histogram[digitLevel][digit]
+    );
+}
+
+groupshared uint LDS_GroupTicket;
+
+[numthreads(GROUP_SIZE_1, 1, 1)]
+void RadixSort_BuildGlobalHistogram (
+    uint3 id : SV_DispatchThreadID,
+    uint groupIdx : SV_GroupIndex,
+    uint3 gIdx : SV_GroupID)
+{
+    // Cross-Group-Serialization
+    uint groupTicket = 0;
+    if (groupIdx == 0){
+        InterlockedAdd(CBuffer_CachedArgs_ScanCounter(0), 1, LDS_GroupTicket);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    groupTicket = LDS_GroupTicket;
+
+    // Detect redundant threads & morton slices
+    // redundant threads are produced due to group size
+    // redundant slices are produced due to data compression
+    uint viewVertCount = CBuffer_CachedArgs_ViewEdgeCounter << 1;
+    uint numValidThreads = (viewVertCount + 3) / 4; // for Redundant thread
+    uint numValidMortons = viewVertCount; // for Redundant slice in valid thread
+    
+    bool validThread = id.x < (numValidThreads);
+    uint start = (id.x << 2); // X4 morton slices each item
+    bool4 validMorton = bool4(
+        start < numValidMortons,
+        ++start < numValidMortons,
+        ++start < numValidMortons,
+        ++start < numValidMortons
+    );
+
+    // Initialize counters in LDS_Histogram
+    uint workingDigit = (groupIdx << 1);
+    uint digitLevel = 0;
+    [unroll]
+    for (;digitLevel < 4; digitLevel++){
+        LDS_Histogram[digitLevel][workingDigit] = 0;
+        LDS_Histogram[digitLevel][workingDigit + 1] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint digitIndex = id.x;
+    uint4 digits = uint4(0, 0, 0, 0);
+    // Only valid threads joins the counting process in shared mem
+    if (validThread){
+        digits.x = CBuffer_StructuredKeyValuePairs[DIGIT_ADDR(0, digitIndex)];
+        digits.y = CBuffer_StructuredKeyValuePairs[DIGIT_ADDR(1, digitIndex)];
+        digits.z = CBuffer_StructuredKeyValuePairs[DIGIT_ADDR(2, digitIndex)];
+        digits.w = CBuffer_StructuredKeyValuePairs[DIGIT_ADDR(3, digitIndex)];
+        // Counting digits in shared memory 
+        // When morton slice is valid
+        if (validMorton.x) { CountDigitsInSharedMem(0, digits.x); }
+        if (validMorton.y) { CountDigitsInSharedMem(1, digits.y); }
+        if (validMorton.z) { CountDigitsInSharedMem(2, digits.z); }
+        if (validMorton.w) { CountDigitsInSharedMem(3, digits.w); }
+    }                                         
+    GroupMemoryBarrierWithGroupSync();
+
+    // Group size(128) is half of digit numbers(256) 
+    // Each thread processes
+    // 2(Bins/DigitLevel) x 4(DigitLevel) = 8Bins 
+    // that is x8 global atomic add calls
+    [unroll]
+    for (digitLevel = 0; digitLevel < 4; digitLevel++){
+        CountDigitsInGlobalMem(digitLevel, workingDigit);
+        CountDigitsInGlobalMem(digitLevel, workingDigit + 1);
+    }
+}
+

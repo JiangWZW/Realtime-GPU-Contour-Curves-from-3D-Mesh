@@ -1,0 +1,166 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel StampContourLinking_CircularPathResolve
+#pragma kernel StampContourLinking_DetectCircularStart
+#pragma kernel StampContourLinking_CircularPathRanking
+ 
+#define TRACING_KERNELS
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourTracingComputeDefs.hlsl"
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+ 
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawStampLinkage;
+
+// #define DEBUG_MAXID_JUMPING
+// #define DEBUG_EDGE_RANKING
+
+
+int _Iteration;
+#define EdgeId (id.x)
+
+[numthreads(GROUP_SIZE_0,1,1)]
+void StampContourLinking_CircularPathResolve(
+	uint3 id : SV_DispatchThreadID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	bool isRedundant = false;
+	EdgeMaxIDLinkRT res = EdgePointerJumpingMaxID_Dbg(
+		EdgeId, EdgeCount,
+		_Iteration, CBuffer_BufferRawStampLinkage,
+		isRedundant
+	);
+#ifdef DEBUG_MAXID_JUMPING
+	uint edgeData = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_EdgesToStamp_AddrAt(EdgeId)
+	);
+	uint stampId = GET_STAMP_EDGE_STAMP_ID(edgeData);
+	float2 stampCoord =
+		(float2)DecodePixelCoord(
+			CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(stampId)));
+	float2 edgeCoord = stampCoord + MoveAtOppositeStamp(GET_STAMP_EDGE_DIR_CURR(edgeData));
+	if ((!isRedundant))
+	{
+		float3 randSeed = RandColRgb(res.maxID, res.maxID * res.maxID);
+		_DebugTexture[edgeCoord] = float4(randSeed, 1);
+	}
+#endif
+}
+
+
+[numthreads(GROUP_SIZE_1, 1, 1)]
+void StampContourLinking_DetectCircularStart(
+	uint3 id : SV_DispatchThreadID
+)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+	// Load edge data
+	uint edgeData = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_EdgesToStamp_AddrAt(EdgeId)
+	);
+	uint currDir = GET_STAMP_EDGE_DIR_CURR(edgeData);
+	// Load linkage info
+	uint nextEdgeID = CBuffer_BufferRawStampLinkage.Load2(
+		CBuffer_BufferRawEdgeLinkage_AddrAt(
+			ORIGINAL_STAMP_LINKAGE, EdgeId)
+	).y;
+
+
+	// Determine if this is a seed node,
+	// using output from pointer jumping
+	uint2 circularLinkData = CBuffer_BufferRawStampLinkage.Load2(
+		CBuffer_BufferRawEdgeLinkage_AddrAt(
+			PINGPONG_STAMP_LINKAGE_0, EdgeId));
+
+	float2 stampCoord =
+		(float2)DecodePixelCoord(
+			CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(
+					(GET_STAMP_EDGE_STAMP_ID(edgeData)))));
+
+	bool isSeed =
+		GET_EDGE_LINK_0_MAX_ID(circularLinkData)
+		== EncodeEdgeMaxID(stampCoord, currDir);
+
+	// Init edge linkage data
+	if (EdgeId < EdgeCount)
+	{
+		CBuffer_BufferRawStampLinkage.Store2(
+			CBuffer_BufferRawEdgeLinkage_AddrAt(PINGPONG_STAMP_LINKAGE_0, EdgeId),
+			EncodeEdgeLink(nextEdgeID, 1, isSeed)
+		);
+
+#ifdef DEBUG_MAXID_JUMPING
+		float2 adjStampCoord = stampCoord + MoveAtOppositeStamp(currDir);
+		if (isSeed)
+		{
+			_DebugTexture[adjStampCoord] = float4(1, 1, 1, 1);
+			_DebugTexture[stampCoord] = float4(1, 0, 1, 1);
+		}
+#endif
+	}
+
+	if (id.x == 0)
+	{
+		// Clear counters, we need them in serialization kernels
+		// CBuffer_CachedArgs_ScanCounter(0) = 0;
+		CBuffer_CachedArgs_ScanCounter(1) = 0;
+	}
+}
+
+[numthreads(GROUP_SIZE_2, 1, 1)]
+void StampContourLinking_CircularPathRanking(
+	uint3 id : SV_DispatchThreadID
+)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	bool isRedundant = false;
+	EdgeLinkRT res = EdgePointerJumping_Dbg(
+		EdgeId, EdgeCount,
+		_Iteration, CBuffer_BufferRawStampLinkage,
+		isRedundant
+	);
+
+	// ------------------------------------------------------------------------
+	// Note on the output of pointer jumping:
+	// each boundary edge loop is flattened into a list by a "seed" edge in it;
+	// each edge has its rank on the edge list as follows:
+	// e.g, lets say the list length is 3:
+	// edge	seed -> e -> e (->seed)
+	// rank 3		2	 1
+
+#ifdef DEBUG_EDGE_RANKING
+	uint edgeData = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_EdgesToStamp_AddrAt(EdgeId)
+	);
+	uint stampId = GET_STAMP_EDGE_STAMP_ID(edgeData);
+	float2 stampCoord =
+		(float2)DecodePixelCoord(
+			CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(stampId)));
+	float2 edgeCoord = stampCoord + MoveAtOppositeStamp(GET_STAMP_EDGE_DIR_CURR(edgeData));
+
+	uint nextStampID = GET_STAMP_EDGE_STAMP_ID(
+		CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_EdgesToStamp_AddrAt(res.nextEdgeID)
+		));
+	float2 nextStampCoord =
+		(float2)DecodePixelCoord(
+			CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(nextStampID)));
+	
+	if ((!isRedundant))
+	{
+		float3 randSeed =
+			RandColRgb(res.nextEdgeID, res.nextEdgeID * res.nextEdgeID);
+		_DebugTexture[edgeCoord] = float4(randSeed.rg, res.rank, 1);
+	}
+#endif
+}

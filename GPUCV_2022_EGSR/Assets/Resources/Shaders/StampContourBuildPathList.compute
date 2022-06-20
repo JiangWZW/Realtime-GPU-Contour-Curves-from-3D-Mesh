@@ -1,0 +1,285 @@
+﻿#pragma kernel StampContourBuildPathList_UpSweep
+#pragma kernel StampContourBuildPathList_Reduce
+#pragma kernel StampContourBuildPathList_DwSweep
+
+#pragma use_dxc
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourBuildPathListComputeDefs.hlsl"
+
+// #define DEBUG_UPSWEEP 
+// #define DEBUG_DWSWEEP
+// #define DEBUG_SCAN
+
+ByteAddressBuffer CBuffer_BufferRawStampLinkage;
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawProceduralGeometry;
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawPathData;
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+StructuredBuffer<uint> CBuffer_CachedArgs1;
+
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+
+
+void LoadPathLengthAndRank(uint edgeId, out uint pathRank, out uint pathLen)
+{
+	return CBuffer_PixelEdgeData_EdgeParam_LoadAll(
+		CBuffer_BufferRawPixelEdgeData,
+		EDGE_PARAM_BRUSH_PATH,
+		edgeId,
+		// out -------------------
+		pathRank, pathLen
+	);
+}
+
+uint LoadPathRank(uint edgeId/*, out uint invalidPathRankPacked*/)
+{
+	return CBuffer_PixelEdgeData_EdgeParam_LoadSegRank(
+		CBuffer_BufferRawPixelEdgeData,
+		EDGE_PARAM_BRUSH_PATH,
+		edgeId
+	);
+}
+
+
+#define NUM_SCAN_BLOCKS_MAX 2048
+uint ComputeGlobalScanBufferOffset(uint scanItemCount)
+{
+	return
+		(scanItemCount << BITS_BLOCK_OFFSET) +	// float4 data
+		(scanItemCount << BITS_WORD_OFFSET) +	// hf
+		(scanItemCount << BITS_BLOCK_OFFSET);	// extra spacing for safety
+}
+uint ComputeReductionBufferOffset()
+{
+	return
+		(NUM_SCAN_BLOCKS_MAX << BITS_BLOCK_OFFSET) + // data
+		(NUM_SCAN_BLOCKS_MAX << BITS_WORD_OFFSET) +	 // hf
+		(NUM_SCAN_BLOCKS_MAX << BITS_WORD_OFFSET);	 // extra
+}
+
+#define TID (id.x)
+
+// Note: All kernels need the path to be shifted for segscan.
+// for details, see "StampContourPathNormalize_ResolveEdgeLoop"
+// and "CBuffer_PixelEdgeData_EdgeIdBeforeShift_AddrAt"
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourBuildPathList_UpSweep(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	uint EdgeId = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_EdgeIdBeforeShift_AddrAt(id.x)
+	);
+	
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+	bool validThread = (max(TID, EdgeId) < EdgeCount);
+
+	uint pathRank = LoadPathRank(EdgeId);
+	bool hf = validThread && (
+		0 == pathRank
+	);
+	
+	uint scanData = hf ? 1 : 0;
+
+	Scan_UpSweep_PathID(
+		true, id, groupIdx, gIdx,
+		SCAN_BUFFER, CBuffer_BufferRawLookBacks,
+		scanData, 
+		0, 0,
+		EdgeCount
+	);
+}
+
+
+
+[numthreads(1024, 1, 1)]
+void StampContourBuildPathList_Reduce(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	ScanReduction_PathID(CBuffer_BufferRawLookBacks, 0, groupIdx);
+}
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampContourBuildPathList_DwSweep(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	uint EdgeId = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_EdgeIdBeforeShift_AddrAt(TID)
+	);
+	bool validThread = max(EdgeId, TID) < EdgeCount;
+
+	uint gIdxScanItem = TID / GROUP_SIZE_0;
+	uint pathID = ScanDwSweep_PathID(
+		TID.xxx, gIdxScanItem.xxx,
+		SCAN_BUFFER,
+		CBuffer_BufferRawLookBacks,
+		0, 0,
+		EdgeCount
+	);
+	pathID -= 1;
+
+	uint pathRank, pathLen;
+	LoadPathLengthAndRank(EdgeId, pathRank, pathLen);
+	
+	if (validThread && pathRank == 0) 
+	{// Each path's head edge is responsible for storing path info
+		CBuffer_BufferRawPathData.Store(
+			CBuffer_PathData_HeadEdgeID_AddrAt(pathID),
+			EdgeId
+		);
+		CBuffer_BufferRawPathData.Store(
+			CBuffer_PathData_Length_AddrAt(pathID),
+			pathLen
+		);
+
+
+		EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+			false, CBuffer_BufferRawStampLinkage, EdgeId
+		);
+		uint numEdgesToEdgeLoopTail = 
+			edgeloop.tailEdgeId - EdgeId + 1;
+
+		uint pathFlags = EncodePathFlags(
+			pathLen == edgeloop.length, // circular path
+			(numEdgesToEdgeLoopTail < pathLen) ?
+			// left_bisect_len = 
+			//	path_len - right_bisect_len
+				pathLen - numEdgesToEdgeLoopTail /* bisected */
+				: 0u
+		);
+		CBuffer_BufferRawPathData.Store(
+			CBuffer_PathData_Flags_AddrAt(pathID), 
+			pathFlags
+		);
+
+		
+		uint pathTailEdgeId = MoveEdgeIdAlongEdgeLoop(
+			edgeloop, EdgeId, (float)(pathLen - 1)
+		);
+		CBuffer_BufferRawPathData.Store(
+			CBuffer_PathData_TailEdgeID_AddrAt(pathID),
+			pathTailEdgeId
+		);
+	}
+
+	if (validThread)
+	{
+		// Edge-to-Path mapping
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_EdgePathID_AddrAt(EdgeId),
+			pathID
+		);
+	}
+	
+	if (TID == EdgeCount - 1)
+	{
+		CBuffer_CachedArgs_PathCounter = pathID + 1;
+	}
+
+#ifdef DEBUG_DWSWEEP
+	uint edgeAttribsRaw =
+		CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+		);
+	EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribsRaw);
+	float2 stampCoord = (float2)
+		DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+			CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo))
+		);
+	float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+
+	
+	if (EdgeId < EdgeCount)
+	{
+		bool drawFlag = (
+			1 == GetEdgeAttrib(
+				BIT_BEG_DRAW_FLAG,
+				BIT_LEN_DRAW_FLAG,
+				edgeAttribsRaw
+			)) && (EdgeId < EdgeCount);
+		float4 dbgCol = 1;
+		if (drawFlag)
+		{
+			_DebugTexture[edgeCoord] = dbgCol;
+		}
+
+		// dbgCol = ?;
+		// if (drawFlag)
+		// {
+		// 	_DebugTexture1[edgeCoord] = dbgCol;
+		// }
+	}
+#endif
+}
+
+
+
+// Dummy, if you are not sure, here is
+// How to debug your silly (seg-)scan:
+//
+// --------------- UP Sweep Dbg Code ---------------------
+// #ifdef DEBUG_SCAN
+// #	define DEBUG_TYPE float4
+// #	define DGB_T_TO_U32(x) (asuint(x))
+// #	define U32_TO_DBG_T(x) (asfloat(x))
+// #endif
+//
+// #ifdef DEBUG_SCAN
+// #define IS_DBG_SCAN_INPUT_VECTOR
+// #define DEBUG_ELEM_VEC_STRIDE 4
+// #define DEBUG_ELEM_STRIDE ((DEBUG_ELEM_VEC_STRIDE << BITS_WORD_OFFSET))
+// #ifdef IS_DBG_SCAN_INPUT_VECTOR
+// #	define STORE_DBG_SCAN_VAL CAT(Store, DEBUG_ELEM_VEC_STRIDE)
+// #else
+// #	define STORE_DBG_SCAN_VAL Store
+// #endif
+// if (validThread)
+// {
+//		uint offset = 0;
+//		CBuffer_BufferRawDebug.Store(
+//			0, EdgeCount
+//		);
+//		offset += (1 << BITS_WORD_OFFSET);
+//		
+//		CBuffer_BufferRawDebug.Store(
+//			offset + (id.x << BITS_WORD_OFFSET), hf
+//		);
+//		
+//		offset += (EdgeCount << BITS_WORD_OFFSET);
+//		
+//		CBuffer_BufferRawDebug.STORE_DBG_SCAN_VAL(
+//			offset + (id.x * DEBUG_ELEM_STRIDE), DGB_T_TO_U32(scanData1.x)
+//		);
+// }
+// #endif
+//
+//
+// --------------- Down Sweep Dbg Code ---------------------
+// #ifdef DEBUG_SCAN
+// DEBUG_TYPE dbgScanRes = SegScanDwSweep_XXXX(
+// 		......
+// );
+// 
+// if (validThread)
+// {
+// 	CBuffer_BufferRawDebug.STORE_DBG_SCAN_VAL(
+// 		(1 << BITS_WORD_OFFSET) // edge counter
+// 		+ (EdgeCount << BITS_WORD_OFFSET)	// input head flags
+// 		+ (EdgeCount * DEBUG_ELEM_STRIDE)		// input data
+// 		+ (id.x * DEBUG_ELEM_STRIDE),  // output element
+// 		DGB_T_TO_U32(testScanRes)
+// 	);
+// }
+// #endif

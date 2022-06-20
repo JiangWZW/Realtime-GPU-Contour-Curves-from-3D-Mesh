@@ -1,0 +1,276 @@
+﻿// #pragma enable_d3d11_debug_symbols
+
+#pragma kernel StampInitAttributes_RPJ
+#pragma kernel StampInitAttributes_ThinningSubPass
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StampInitAttributesComputeDefs.hlsl"
+
+
+Texture2D<float4> _CameraDepthTexture;
+SamplerState sampler_linear_clamp;
+SamplerState sampler_point_clamp;
+
+
+RWByteAddressBuffer CBuffer_BufferRawProceduralGeometry;
+
+float4x4 CMatrix_HMVP;
+float4x4 CMatrix_I_HMVP;
+float4x4 CMatrix_I_MVP;
+float4x4 CMatrix_MVP;
+float4x4 CMatrix_M;
+
+ByteAddressBuffer CBuffer_BufferRawRasterDataPerSeg;
+ByteAddressBuffer CBuffer_BufferRawRasterDataPerContour;
+
+RWByteAddressBuffer CBuffer_BufferRawStampPixels;
+RWByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+RWByteAddressBuffer CBuffer_BufferRawFlagsPerStamp;
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+RWStructuredBuffer<uint> CBuffer_StampDrawIndirectArgs;
+
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgs;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgs1;
+
+// RWTexture2D<float> _ContourSkeletonTex0;
+RWTexture2D<int> _PerPixelSpinLockTex;
+RWTexture2D<float4> _DebugTexture;
+
+#define RPJ_HALF_PX_OFFSET
+
+float4 ComputeStampRPJPos(
+	uint visibleSegId, float viewZ, 
+	out float2 motionVec, out float3 stampPosOS, 
+	out float2 lastFrameCoord)
+{
+	uint2 visibleSegToContourData =
+		CBuffer_BufferRawRasterDataPerSeg.Load2(
+			CBuffer_BufferRawVisibleSegToContour(visibleSegId)
+		);
+	float linearInterp = asfloat(visibleSegToContourData.x);
+	uint contourId = visibleSegToContourData.y; // TODO: encapsulate this decoding logic
+	
+	// Load Per-Contour Raster Data II
+	// --------------------------------------------------------------------------
+	uint ldAddr = CBuffer_BufferRawRasterDataPerContour_II_AddrAt(contourId);
+	// Load per-contour raster data computed in prev kernel
+	float4 edgeVert0 = asfloat(CBuffer_BufferRawRasterDataPerContour.Load4(ldAddr));
+	ldAddr = MoveAddrSingleBlock(ldAddr);
+	float4 edgeVert1 = asfloat(CBuffer_BufferRawRasterDataPerContour.Load4(ldAddr));
+
+
+	stampPosOS = 
+		lerp( // Object-Space, Perspective-correct interpolation
+			edgeVert0.xyz / (edgeVert0.w),
+			edgeVert1.xyz / (edgeVert1.w),
+			linearInterp
+		) * viewZ;
+
+	// Object Space >>> Prev-Frame NDC Space
+	float4 lastFramePos = mul(CMatrix_HMVP, float4(stampPosOS, 1.0f));
+	lastFramePos = lastFramePos / lastFramePos.w;
+	lastFramePos.xy = (lastFramePos.xy * .5 + .5); // 0-1 ndc space
+	
+	float4 currFramePos = mul(CMatrix_MVP, float4(stampPosOS, 1.0f));
+	currFramePos = currFramePos / currFramePos.w;
+	currFramePos.xy = (currFramePos.xy * .5 + .5); // 0-1 ndc space
+
+    lastFrameCoord = lastFramePos.xy;
+    lastFrameCoord *= _ScreenParams.xy;
+
+	motionVec = (currFramePos.xy - lastFramePos.xy);
+	motionVec *= _ScreenParams.xy;
+	
+	return lastFramePos;
+}
+
+#define MAX_SCORE (5u) // close on mesh && is stroke sample && valid
+uint ComputeRPJSampleFitness(uint sampleMark)
+{
+	// Note: Distance validation is currently deactivated,
+	// Due to the fact that it causes stamp-scale-flickering
+	// DistInWorldSpace(sampleID, sampleCoord, stampPosWS);
+	float distWS = 1.0f;
+	// Clamp & Normalize world space dist
+	// distWS = clamp(distWS, 0, POS_WS_MIN_DIST) / (POS_WS_MIN_DIST);
+
+	uint score = 0, pptr = 0;
+	DecodeRPJMark(sampleMark, score, pptr);
+	
+	return score;
+}
+
+static int2 sample3x3OffsetsDiag[4] = {
+	Offset_TopLeft, Offset_TopRight,
+	Offset_BottomLeft, Offset_BottomRight
+};
+static int2 sample3x3OffsetsCross[4] = {
+	Offset_TopCenter, Offset_CenterLeft,
+	Offset_CenterRight, Offset_BottomCenter
+};
+
+
+[numthreads(GROUP_SIZE_0,1,1)]
+void StampInitAttributes_RPJ(
+	uint3 id : SV_DispatchThreadID,
+	uint groupId : SV_GroupIndex,
+	uint3 gId : SV_GroupID)
+{
+#define STAMP_ID (id.x)
+	// ----------------------------------------------------------
+	// Fetch Stamp Coordinate
+	// ----------------------------------------------------------
+	const uint StampId = id.x;
+	uint packedStampCoord;
+	DecodePixelCoordWithFlags(
+		CBuffer_BufferRawStampPixels.Load(
+			CBuffer_BufferRawStampPixels_AddrAt(StampId)),
+		// out
+		packedStampCoord
+	);
+	float2 stampCoord = (float2)DecodePixelCoord(packedStampCoord);
+	const uint StampCount = CBuffer_CachedArgs_PixelCounter;
+
+
+	// ----------------------------------------------------------
+	// Attribute Sampling from G-Texture
+	// ----------------------------------------------------------
+	// Take g-buffer sample
+	int2 attribSampleCoord = (int2)(stampCoord.xy/* + offsetToSplatCenter*/ + .1f);
+
+	ContourSegRaster_VSOutput attribs_convertor;
+	attribs_convertor.posCS = 0; // dummy field, dont care
+	attribs_convertor.packedData = 
+		_ContourGBuffer0.Load(int3(attribSampleCoord, 0));
+
+	// Decode g-buffer attributes
+	ContourSegRasterData fragData; uint splatId; // out
+	attribs_convertor.Decode_packedData(fragData, splatId);
+
+	float2 tangent = float2(-fragData.normal.y, fragData.normal.x);
+
+
+	// ----------------------------------------------------------
+	// Estimate Motion Vector
+	// ----------------------------------------------------------
+	// Reprojection to last frame screen position
+	float2 motionVec = 0;
+    float2 lastFrameCoord = 0;
+	float3 stampPosOS = 0;
+	float4 stampPosHNDC = ComputeStampRPJPos(
+		fragData.visibleSegIndex, fragData.viewZ, 
+		/*out*/motionVec, stampPosOS, lastFrameCoord
+	);
+
+	
+	// ----------------------------------------------------------
+	// Store Stamp Attributes
+	// ----------------------------------------------------------
+	if (STAMP_ID < StampCount)
+	{
+		CBuffer_BufferRawStampGBuffer.Store(
+			CBuffer_BufferRawStampVectorInfo_AddrAt(StampId),
+			asuint(PackUnitVector_2D_ToFp(tangent)) // tangent
+		);
+		CBuffer_BufferRawStampGBuffer.Store2(
+			CBuffer_BufferRawStampMotionVector_AddrAt(StampId),
+			asuint(motionVec)
+		);
+		CBuffer_BufferRawStampGBuffer.Store(
+			CBuffer_BufferRaw_StampViewDepth_AddrAt(StampId),
+			asuint(fragData.viewZ) // positive view depth (larger closer)
+		);
+		CBuffer_BufferRawStampGBuffer.Store(
+			CBuffer_BufferRawStamp_ScreenDepthGrad_AddrAt(StampId),
+			asuint(fragData.depthGrad) // viewZ screen gradient
+		);
+		CBuffer_BufferRawStampPixels.Store(
+			CBuffer_BufferRawStampPixels_AddrAt(StampId),
+			packedStampCoord
+		);
+		CBuffer_BufferRawStampPixels.Store3(
+			CBuffer_StampPixels_ObjectSpacePosition_AddrAt(StampId),
+			asuint(stampPosOS)
+		);
+		CBuffer_BufferRawFlagsPerStamp.Store(
+			CBuffer_BufferRaw_FlagsPerStamp_AddrAt(StampId),
+			EncodeStampFlag(
+				0, // set at "StampToPixelEdges"
+				splatId, 
+				0 
+			)
+		);
+		CBuffer_BufferRawFlagsPerStamp.Store(
+			CBuffer_BufferRaw_StampCoverageByParticle_AddrAt(StampId),
+			0
+		);
+
+		// Init skeleton ping-pong textures
+		_PerPixelSpinLockTex[stampCoord] = StampId + 1;
+		
+		// _DebugTexture[stampCoord] = COL_G;
+	}
+}
+
+
+// Note: Deprecated.
+int _SubIteration;
+
+[numthreads(GROUP_SIZE_1,1,1)]
+void StampInitAttributes_ThinningSubPass(
+	uint3 id : SV_DispatchThreadID)
+{
+	// uint subiteration = (uint)_SubIteration;
+	// uint subPass = subiteration % 2;
+	//
+	// const uint StampId = id.x;
+	// const uint StampCount = CBuffer_CachedArgs_PixelCounter;
+	// bool validThread = StampId < StampCount;
+	//
+	// uint2 stampCoord =
+	// 	DecodePixelCoord(
+	// 		CBuffer_BufferRawStampPixels.Load(
+	// 			CBuffer_BufferRawStampPixels_AddrAt(StampId)));
+	//
+	// uint stampFlag = CBuffer_BufferRawFlagsPerStamp.Load(StampId << 2);
+	// bool deletable = (subiteration == 0) ? false : (!StampFlag_SkeletonFlag(stampFlag));
+	//
+	// uint boxCode;
+	// if (subPass == 0)
+	// {
+	// 	// boxCode = ExtractNeighborBinaryCode_Box3X3_R(
+	// 	// 	SampleBox3x3_UAV_R(_ContourSkeletonTex0, (int2)stampCoord));
+	// }
+	// else
+	// {
+	// 	// boxCode = ExtractNeighborBinaryCode_Box3X3_R(
+	// 	// 	SampleBox3x3_UAV_R(_ContourSkeletonTex1, (int2)stampCoord));
+	// }
+	//
+	// // Remove spurs & isolated noises
+	// deletable = deletable
+	// 	|| (LineEndTest(boxCode) == TYPE_LINEEND_0) // Spurs
+	// 	|| countbits(boxCode & 0x000000ff) == 0; // Salt Noise
+	//
+	// if (subPass == 0 && validThread)
+	// {
+	// 	// _ContourSkeletonTex1[stampCoord] = deletable ? 0 : 1;
+	// }
+	// if (subPass == 1 && validThread)
+	// {
+	// 	// _ContourSkeletonTex0[stampCoord] = deletable ? 0 : 1;
+	// }
+	//
+	// if (validThread)
+	// {
+	// 	CBuffer_BufferRawFlagsPerStamp.Store(
+	// 		StampId << 2,
+	// 		EncodeStampFlag(
+	// 			(!deletable), // is skeleton == !deleted 
+	// 			StampFlag_Topology(stampFlag), // topology type
+	// 			(boxCode & 0x000000ff) // 3x3 box code
+	// 		)
+	// 	);
+	// }
+}

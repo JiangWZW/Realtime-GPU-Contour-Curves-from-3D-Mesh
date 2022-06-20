@@ -1,0 +1,218 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel StampContourTangentFitting_MLS
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourTangentFittingComputeDefs.hlsl"
+
+// #define DEBUG_SMOOTHED_COORD
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+ByteAddressBuffer CBuffer_BufferRawStampLinkage;
+
+#define FITTING_RADIUS 12
+
+void StoreGlobalConvData(uint edgeId, T_CONV convRes)
+{
+	PING_PONG_BUFFER.Store(
+		Conv_Buffer_ConvData_AddrAt((_PingPong + 1) % 2, edgeId),
+		PackUnitVector_2D(convRes)
+	);
+}
+
+
+void AccumulateWLSParams(
+	float l, float2 dl,
+	inout float3 a_123,
+	inout float4 b_x1y1_x2y2
+)
+{
+	// Weight
+	float wi = abs(l) / (float)FITTING_RADIUS;
+
+	float val = wi * l * l;
+	a_123[0] += val; // a1 <- a1 + wi * li^2
+	val *= (0.5 * l);
+	a_123[1] += val; // a2 <- a2 + wi/2 * li^3
+	val *= (0.5 * l);
+	a_123[2] += val; // a3 <- a3 + wi/4 * li^4
+
+	dl = (wi * l) * dl;
+	b_x1y1_x2y2.xyzw += float4(dl.xy, 0.5 * l * dl.xy);
+}
+
+
+float CurveFitting(
+	float2 edgeCoord, 
+	EdgeLoopTopology edgeloop,
+	uint blockId, 
+	uint groupIdx : SV_GroupIndex, 
+	out float2 tangent, out float deltaArcLen
+){
+	// WLS Params ------------------------------------------
+	float3 a_123 = 0;		// .xyz:	[a1, a2, a3]
+	float4 b_x1y1_x2y2 = 0; // .xyzw:	[bx1, by1, bx2, by2]
+	
+	float l_l = 0; // current arc len (left)
+	float l_r = 0; // current arc len (right)
+	[unroll]
+	for (uint d = 1; d <= FITTING_RADIUS; ++d)
+	{
+		T_CONV neighCoord = LoadLDSConvData_AtLeft_QuadraticFit(
+			d,
+			blockId, groupIdx,
+			edgeloop.length, edgeloop.headEdgeId
+		);
+
+		float2 dl = neighCoord - edgeCoord;
+		if (d == 1)
+		{
+			deltaArcLen = length(dl); // ds = si - s[(i-1+loopLen)%loopLen]
+		}
+
+		l_l -= length(dl);
+		AccumulateWLSParams(l_l, dl, a_123, b_x1y1_x2y2);
+	}
+
+
+	[unroll]
+	for (uint d = 1; d <= FITTING_RADIUS; ++d)
+	{
+		CONV_DATA_T neighCoord =
+			LoadLDSConvData_AtRight_QuadraticFit(
+				d,
+				blockId, groupIdx,
+				edgeloop.length, edgeloop.headEdgeId
+			);
+
+		float2 dl = neighCoord - edgeCoord;
+		l_r += length(dl);
+		AccumulateWLSParams(l_r, dl, a_123, b_x1y1_x2y2);
+	}
+
+#define A1 a_123[0]
+#define A2 a_123[1]
+#define A3 a_123[2]
+#define BX1 b_x1y1_x2y2.x
+#define BY1 b_x1y1_x2y2.y
+#define BX2 b_x1y1_x2y2.z
+#define BY2 b_x1y1_x2y2.w
+
+	// ---------------------------------------------------------------------------
+	// Compute Curvature, TNB
+	// ---------------------------------------------------------------------------
+	float dInv = rcp((A1 * A3) - (A2 * A2));
+	float2 dr = float2(		// (dx, dy)
+		(A3 * BX1) - (A2 * BX2),
+		(A3 * BY1) - (A2 * BY2)
+		);
+	dr *= dInv;
+
+	float2 ddr = float2(	// (ddx, ddy)
+		(A1 * BX2) - (A2 * BX1),
+		(A1 * BY2) - (A2 * BY1)
+		);
+	ddr *= dInv;
+
+	float len_dr = length(dr);
+	float curv = (dr.x * ddr.y - dr.y * ddr.x) / (len_dr * len_dr * len_dr);
+	// curv = abs(curv);
+
+	tangent = normalize(dr);
+
+	return curv;
+}
+
+
+
+#define EdgeId ((id.x))
+[numthreads(GROUP_SIZE_CONV, 1, 1)]
+void StampContourTangentFitting_MLS(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	bool isRedundantThread = id.x >= EdgeCount;
+
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage, 
+		EdgeId
+	);
+
+	float2 edgeCoordSmooth;
+	SetupSegmentedConvolution_QuadraticFit(
+		gIdx, groupIdx, EdgeCount,
+		/*out*/edgeCoordSmooth
+	);
+
+	// Apply curve-fitting ----------------------------------------------------------
+	// For details, see "StrokeFormation.compute"
+	// and paper "Curvature and torsion estimators based on parametric curve fitting"
+	float2 tangent;
+	float deltaArcLen; // smoothed distance from this to prev edge in the edge-loop 
+	float curv = CurveFitting(
+		edgeCoordSmooth, edgeloop, 
+		gIdx.x, groupIdx,
+		// out -------------
+		tangent, deltaArcLen 
+	);
+
+	
+
+	if (EdgeId < EdgeCount)
+	{
+		PING_PONG_BUFFER.Store(
+			Conv_Buffer_ConvData_AddrAt(2, EdgeId),
+			asuint(curv)
+		);
+
+		PING_PONG_BUFFER.Store(
+			Conv_Buffer_ConvData_AddrAt(0, EdgeId),
+			PackUnitVector_2D(tangent)
+		);
+
+		CBuffer_BufferRawPixelEdgeData.Store2(
+			CBuffer_PixelEdgeData_SmoothCoord_AddrAt(EdgeId),
+			asuint(edgeCoordSmooth)
+		);
+
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_ArcLenParam_AddrAt(EdgeId),
+			asuint(deltaArcLen) // For now only store dP:=(Pi - Pi-1)
+			// Later a seg-scan kernel should accumulate the real arclen param.
+		);
+
+
+#ifdef DEBUG_SMOOTHED_COORD
+		uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+		);
+		EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+
+		float2 stampCoord = (float2)
+			DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo)));
+
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+
+		_DebugTexture[(int2)convData] =
+			float4(edgeCoord.xy, ((float)_PingPong + 1.0) * 0.25f, 1);
+#endif
+	}
+}
+
+#undef EdgeId
+
+
+
+
+
+

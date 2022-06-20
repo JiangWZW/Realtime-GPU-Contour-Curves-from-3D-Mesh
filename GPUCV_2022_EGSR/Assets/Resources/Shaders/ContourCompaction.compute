@@ -1,0 +1,171 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ContourCompaction_Scan
+
+// Inputs ------------------------------------------
+#include "../ShaderLibrary/CustomComputeInputs.hlsl"
+
+// Buffer Views -----------------------------------
+#include "../ShaderLibrary/ComputeKernelConfigs/CompactionComputeDefs.hlsl"
+
+// Macros ----------------------------------------------------
+#define GROUP_SIZE 256
+#define DATA_SIZE 2 * GROUP_SIZE
+// Padding Macros for Eliminating Bank Conficts
+#define NUM_BANKS 32
+#define LOG_NUM_BANKS 5
+#define OFFSET_BANK_CONFLICT_FREE(x) ((x) >> LOG_NUM_BANKS)
+
+// Resources -------------------------------------------
+RWByteAddressBuffer CBuffer_BufferRawPerEdge;
+#ifdef DEBUG
+RWByteAddressBuffer CBuffer_BufferRawPerEdgeDebug;
+#endif
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+
+groupshared uint LDS_BufferPerData[DATA_SIZE + DATA_SIZE / NUM_BANKS];
+// We do padding for shared memory against bank-conficts
+
+uint4 uint4PrefixSum(uint4 localData){
+   uint4 res = uint4(0, 0, 0, 0);
+   // Note: x always 0, so we store original w in x
+   // and we'll use that w value later
+   res.xyzw += localData.wxyz;
+   res.zw += localData.xy;
+   res.w += localData.x;
+
+   return res;
+}
+
+#define ORIGINAL_W_VAL(val) (val.x)
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ContourCompaction_Scan(
+    uint3 id : SV_DispatchThreadID,
+    uint groupIdx : SV_GroupIndex,
+    uint3 gId : SV_GroupID
+){  
+    // --------------------------------------------------------
+    // Phase I
+    const uint groupOffset = ((uint)DATA_SIZE) * gId.x;
+
+    uint ai = groupIdx;
+    uint aiInput = groupOffset + ai;
+    aiInput = CBuffer_BufferRawPerEdge_AddrAt(aiInput);
+    //   0   1   2   3 ... 127  => ai
+    
+    uint bi = ai + DATA_SIZE / 2;
+    uint biInput = groupOffset + bi;
+    biInput = CBuffer_BufferRawPerEdge_AddrAt(biInput);
+    // 128 129 130 131 ... 255  => bi
+
+    uint aiOffset = OFFSET_BANK_CONFLICT_FREE(ai);
+    //   0 ---------------- 0   => offset(ai)
+    uint biOffset = OFFSET_BANK_CONFLICT_FREE(bi);
+    //   1 ---------------- 1   => offset(bi)
+    // Interleaved Storage, ith(i % 32 == 0) is not used
+    uint4 uint4PostSumAi = uint4(0, 0, 0, 0);
+    uint4 uint4PostSumBi = uint4(0, 0, 0, 0);
+    uint tailValue = 0;
+    
+    uint4PostSumAi = CBuffer_BufferRawPerEdge.Load4(aiInput);
+    uint4PostSumBi = CBuffer_BufferRawPerEdge.Load4(biInput);
+#ifdef DEBUG
+    // // Debug ---------------------------------------------------//
+    CBuffer_BufferRawPerEdgeDebug.Store4(aiInput, uint4PostSumAi); //
+    CBuffer_BufferRawPerEdgeDebug.Store4(biInput, uint4PostSumBi); //
+    // // ---------------------------------------------------------//
+#endif
+    uint4PostSumAi = uint4PrefixSum(uint4PostSumAi);
+    uint4PostSumBi = uint4PrefixSum(uint4PostSumBi);
+    
+    LDS_BufferPerData[ai + aiOffset] = uint4PostSumAi.w + ORIGINAL_W_VAL(uint4PostSumAi);
+    tailValue = uint4PostSumBi.w + ORIGINAL_W_VAL(uint4PostSumBi);
+    LDS_BufferPerData[bi + biOffset] = tailValue;
+    // [0, 31]  X [32, 63] X  [64, 95]  X [96, 127]  -- Input CBuffer
+    //   + 0________+1___________+2___________+3 ... -- + OFFSET_BANK...(x)
+    // [0, 31] 32 [33, 64] 65 [66, 97] 98 [99, 130]  -- LDS_BufferPerData
+
+    // ---------------------------------------------------
+    // Phase II
+    // Work Indices:
+    // a(i, k) = (2^k) * (2i + 1) - 1, 
+    // b(i, k) = a(i, k) + 2^k;
+    // i ~ groupIdx, k ~ iteration, all start from 0.
+    uint offset = 1;     // Step Length == 2^k
+    uint d = DATA_SIZE / 2; // [0, ... , d]th threads are dispatched
+    for (; d > 0; d >>= 1){
+        GroupMemoryBarrierWithGroupSync();
+        if (groupIdx < d){
+            ai = offset * (2 * groupIdx + 1) - 1;
+            bi = offset * (2 * groupIdx + 2) - 1;
+            ai += OFFSET_BANK_CONFLICT_FREE(ai);
+            bi += OFFSET_BANK_CONFLICT_FREE(bi);
+
+            LDS_BufferPerData[bi] += LDS_BufferPerData[ai];
+        }
+        offset *= 2;
+    }
+    
+    // ---------------------------------------------------
+    // Phase II
+    if (groupIdx == 0){
+        // Zero last elem
+        uint lastIndex = DATA_SIZE - 1 + OFFSET_BANK_CONFLICT_FREE(DATA_SIZE - 1);
+        LDS_BufferPerData[lastIndex] = 0;
+    }
+
+    
+    // ---------------------------------------------------
+    // Phase III
+    // Util this point, 
+    // d == 0, 
+    // offset == GROUP_SIZE * 2 == DATA_SIZE
+    // This is actually "rolling back + mirror" fasion of Phase I,
+    // So this execution code is a mirrored loop
+    for (d = 1; d < DATA_SIZE; d *= 2){
+        offset >>= 1;
+        GroupMemoryBarrierWithGroupSync();
+        if (groupIdx < d){
+            // So the indexing function is the same, (rolling back)
+            // just the roles of ai & bi are switched
+            ai = offset * (2 * groupIdx + 1) - 1;
+            bi = offset * (2 * groupIdx + 2) - 1;
+            ai += OFFSET_BANK_CONFLICT_FREE(ai);
+            bi += OFFSET_BANK_CONFLICT_FREE(bi);
+
+            uint aiValOld = LDS_BufferPerData[ai];
+            LDS_BufferPerData[ai] = LDS_BufferPerData[bi];
+            LDS_BufferPerData[bi] += aiValOld;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint pSumAtAi = LDS_BufferPerData[groupIdx + aiOffset];
+    uint pSumAtBi = LDS_BufferPerData[groupIdx + GROUP_SIZE + biOffset];
+    
+    if (groupIdx == GROUP_SIZE - 1){
+        // Save counter into padding slot (which is not used) 
+        InterlockedAdd(
+            CBuffer_CachedArgs_ContourCounter, // # Per thread processes 8 edges
+            // tail value = .w(== original x + y + z) + .x(== original w)
+            (pSumAtBi + tailValue),
+            LDS_BufferPerData[32]
+        );
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    
+    uint groupScanOffset = LDS_BufferPerData[32];
+    pSumAtAi += groupScanOffset;
+    pSumAtBi += groupScanOffset;
+   
+    // .x previously used as temp slot for .w val,
+    // we clear it out here.
+    // w x x+y x+y+z -> 0 x x+y x+y+z
+    uint4PostSumAi.x = uint4PostSumBi.x = 0;
+    uint4PostSumAi.xyzw += pSumAtAi.xxxx;
+    uint4PostSumBi.xyzw += pSumAtBi.xxxx;
+
+    CBuffer_BufferRawPerEdge.Store4(aiInput, uint4PostSumAi);
+    CBuffer_BufferRawPerEdge.Store4(biInput, uint4PostSumBi);
+}

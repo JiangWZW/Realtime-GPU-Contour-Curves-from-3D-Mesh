@@ -1,0 +1,299 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel StampToImageGrid_ScatterPixelEdgeData
+#pragma kernel StampToImageGrid_GatherPixelEdgeData
+
+#pragma use_dxc
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StampToImageGridComputeDefs.hlsl"
+
+// #define DEBUG_KERNEL_STAMP
+
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawStampLinkage;
+RWByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+RWByteAddressBuffer CBuffer_BufferRawProceduralGeometry;
+
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawFlagsPerStamp;
+
+StructuredBuffer<uint> CBuffer_CachedArgs;
+StructuredBuffer<uint> CBuffer_CachedArgs1;
+
+
+/**
+ * \brief Loads Stamp Coord in Screen Space
+ * \param stampId
+ * \param screenResInv
+ * \return
+ */
+uint2 LoadStampCoord(uint stampId)
+{
+	uint2 stampCoord = 
+		DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+			CBuffer_BufferRawStampPixels_AddrAt(stampId)
+		));
+
+	return stampCoord;
+}
+
+void LoadStrokeParameter(uint edgeId, out uint strokeRank, out uint strokeLength)
+{
+	uint2 params = CBuffer_BufferRawPixelEdgeData.Load2(
+		CBuffer_PixelEdgeData_EdgeParam_AddrAt(
+			EDGE_PARAM_STROKE,
+			edgeId
+		)
+	);
+
+	strokeRank = params.x;
+	strokeLength = params.y;
+}
+
+void UploadDataToStamp
+(
+	bool validThread,
+	uint edgeID, uint edgeDir, uint stampID,
+
+	bool projectStamp,
+	bool edgeOnStroke
+)
+{
+	// ------------------------------------------------------------------
+	// Store History Reference
+	// ------------------------------------------------------------------
+	if (validThread)
+	{ // history sample is referenced by pixel-edge index
+		uint rpjSampleAttr = EncodeRPJSampleAttr(edgeID);
+		SetRPJSampleAttr( // essential info about this edge is also encoded
+			STROKE_SAMPLE, edgeOnStroke,
+			/*inout*/rpjSampleAttr
+		);
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_StampToEdges_AddrAt(stampID, edgeDir),
+			projectStamp ? rpjSampleAttr : INVALID_STAMP_EDGE
+		);
+	}
+}
+
+
+#define EdgeId ((id.x))
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampToImageGrid_ScatterPixelEdgeData(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	bool validThread = EdgeId < EdgeCount;
+
+	uint edgeAttrsRaw = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(
+			0, EdgeId)
+	);
+	bool deleted =
+		GetEdgeAttrib(
+			BIT_BEG_DEL_FLAG,
+			BIT_LEN_DEL_FLAG,
+			edgeAttrsRaw);
+	bool drawEdge = (!deleted) && (
+		1 == GetEdgeAttrib(
+			BIT_BEG_DRAW_FLAG,
+			BIT_LEN_DRAW_FLAG,
+			edgeAttrsRaw)
+		) && (EdgeId < EdgeCount);
+	bool oriented = (!deleted) && (
+		1 == GetEdgeAttrib(
+			BIT_BEG_ORIENT_FLAG,
+			BIT_LEN_ORIENT_FLAG,
+			edgeAttrsRaw
+		)) && (EdgeId < EdgeCount);
+	bool edgeLoop = (
+		1 == GetEdgeAttrib(
+			BIT_BEG_LOOP_FLAG,
+			BIT_LEN_LOOP_FLAG,
+			edgeAttrsRaw
+		)) && (EdgeId < EdgeCount);
+	EdgeAttrib edgeAttrs = DecodeEdgeAttrib(edgeAttrsRaw);
+
+
+	UploadDataToStamp(
+		(EdgeId < EdgeCount),
+		EdgeId, edgeAttrs.edgeDir,
+		edgeAttrs.stampInfo,
+		(EdgeId < EdgeCount) && (!deleted),
+		drawEdge
+	);
+}
+#undef EdgeId
+
+
+
+
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampToImageGrid_GatherPixelEdgeData(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+#define StampId ((id.x))
+	uint StampCount = CBuffer_CachedArgs_PixelCounter;
+	uint2 stampCoord = LoadStampCoord(StampId);
+	
+	uint stampFlag = CBuffer_BufferRawFlagsPerStamp.Load(
+		CBuffer_BufferRaw_FlagsPerStamp_AddrAt(StampId)
+	);
+
+	// Receive pixel edge info
+	// from kernel "StampVertexGenerator"
+	// via function "UploadDataToStamp(...)"
+	uint4 pixelEdgeSamples = CBuffer_BufferRawPixelEdgeData.Load4(
+		CBuffer_PixelEdgeData_StampToEdges_AddrAt(StampId, 0)
+	); // edge-id encoded with flags
+	// stamp has no pixel-edge
+	bool contourStamp = !(all(pixelEdgeSamples == INVALID_STAMP_EDGE));
+
+
+	bool foundValidSample = false;
+	bool foundSampleOnStroke = false;
+	uint sampleEdgeId = 0xffffffff;
+	uint maxStrokeLen = 0;
+
+
+	[unroll]
+	for (uint edgeDir = 0; edgeDir < 4; ++edgeDir)
+	{
+		uint currEdgeSample = pixelEdgeSamples[edgeDir];
+
+		bool currSampleValid = (currEdgeSample != INVALID_STAMP_EDGE);
+		if (currSampleValid)
+		{
+			uint currEdgeId = DecodeRPJSampleID(currEdgeSample);
+			if (!foundValidSample) 
+			{
+				sampleEdgeId = currEdgeId;
+				foundValidSample = true;
+			}
+	
+			bool currSampleOnStroke =
+				(1 == (GetRPJSampleAttr(STROKE_SAMPLE, currEdgeSample)));
+			if (currSampleOnStroke)
+			{
+				if (!foundSampleOnStroke)
+				{
+					sampleEdgeId = currEdgeId;
+					foundSampleOnStroke = true;
+				}
+
+				uint strokeLen = CBuffer_PixelEdgeData_EdgeParam_LoadSegLength(
+					CBuffer_BufferRawPixelEdgeData, EDGE_PARAM_STROKE,
+					currEdgeId
+				);
+				if (maxStrokeLen < strokeLen)
+				{
+					sampleEdgeId = currEdgeId;
+					maxStrokeLen = strokeLen;
+				}
+			}
+		}
+	}
+
+	ContourCoverageSample stampCovInfo;
+	stampCovInfo.DecodeFromTexSample(0);
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage, sampleEdgeId);
+	uint stkRank = CBuffer_PixelEdgeData_EdgeParam_LoadSegRank(
+		CBuffer_BufferRawPixelEdgeData, EDGE_PARAM_STROKE,
+		sampleEdgeId
+	);
+	uint stkHeadId = MoveEdgeIdAlongEdgeLoop(
+		edgeloop, sampleEdgeId, -(float)(stkRank)
+	);
+
+	// Clean up for JFA kernel
+	// -----------------------------------------------
+	bool sdfSeedPixel = true; contourStamp;
+	if ((!foundSampleOnStroke) && contourStamp)
+	{ 
+		sdfSeedPixel = false;
+	}
+	if (foundSampleOnStroke)
+	{ // Apply coverage test
+		stampCovInfo.DecodeFromTexSample(
+			_ContourGBuffer0.Load(int3(stampCoord, 0))
+		);
+		
+		if (stkHeadId != stampCovInfo.ptclId)
+		{ // stroke being covered
+			foundSampleOnStroke = false;
+			sdfSeedPixel = false;
+		}
+	}
+	
+
+
+	if ((StampId < StampCount))
+	{
+		// Store stamp info into texture pixel
+		uint gridSample = 0;
+		SetRPJSampleIndex(StampId, gridSample);
+		SetRPJSampleAttr(VALID_SAMPLE,	1,					 gridSample);
+		SetRPJSampleAttr(STROKE_SAMPLE, foundSampleOnStroke, gridSample);
+		_ReProjectionTex[stampCoord] = gridSample;
+
+		// Update stamp flag,
+		// contour flag needs to be updated since,
+		// despeckling will remove some small edge loops,
+		SetStampFlag(STAMP_EDGE_ID, sampleEdgeId, stampFlag);
+		SetStampFlag(STAMP_STK, foundSampleOnStroke, stampFlag);
+		SetStampFlag(STAMP_CONTOUR, contourStamp, stampFlag);
+		SetStampFlag(STAMP_SDF, sdfSeedPixel, stampFlag);
+		CBuffer_BufferRawFlagsPerStamp.Store(
+			CBuffer_BufferRaw_FlagsPerStamp_AddrAt(StampId),
+			stampFlag
+		);
+		
+
+		
+		uint updatedStampTangentPacked = -1;
+		if (foundSampleOnStroke)
+		{ // Update to edge tangent if we can.
+			// stamp tangent can be noisy
+			float2 edgeTangent = UnpackUnitVector_2D(
+			CBuffer_BufferRawPixelEdgeData.Load(
+					CBuffer_PixelEdgeData_EdgeTangent_AddrAt(sampleEdgeId))
+			);
+			updatedStampTangentPacked = 
+				asuint(PackUnitVector_2D_ToFp(edgeTangent));
+			CBuffer_BufferRawStampGBuffer.Store(
+				CBuffer_BufferRawStampVectorInfo_AddrAt(StampId),
+				updatedStampTangentPacked
+			);
+		}
+
+#ifdef DEBUG_KERNEL_STAMP
+		float4 dbgCol =
+			(contourStamp == GetStampFlag(STAMP_CONTOUR, stampFlag)
+			 ? COL_G : COL_R);
+			// _ContourGBuffer0.Load(int3(stampCoord, 0));
+		_DebugTexture1[stampCoord] = dbgCol;
+
+		dbgCol = float4(
+			stampCovInfo.ptclId, 
+			stkHeadId,
+			sampleEdgeId, 
+			contourStamp
+		);
+		// _DebugTexture[stampCoord] = dbgCol;
+#endif
+	}
+}
+
+
+

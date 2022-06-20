@@ -1,0 +1,315 @@
+<!doctype html>
+<html>
+<head>
+<meta charset='UTF-8'><meta name='viewport' content='width=device-width initial-scale=1'>
+<title>Manual</title></head>
+<body><h2>ShaderlabVSCode</h2>
+<div>[TOC]</div>
+<h2>Introduction</h2>
+<p>ShaderlabVSCode is a Visual Studio Code extension for Unity Shaderlab progamming.</p>
+<p><a href='http://www.amlovey.com/'><strong>Documents</strong></a> | <a href='http://forum.unity3d.com/threads/403471/'><strong>Forum</strong> </a> | <a href='mailto:amlovey@qq.com'><strong>Email</strong></a> |<a href='https://www.assetstore.unity3d.com/#!/content/94653?aid=1011lGoJ'><strong>Asset Store</strong></a></p>
+<p>&nbsp;</p>
+<h2>Installation</h2>
+<h3>Running On Mac</h3>
+<ol start='' >
+<li>Import ShaderlabVSCode unity package into Unity Editor.</li>
+<li><a href='https://go.microsoft.com/fwlink/?LinkID=534106'>Download Visual Studio Code</a> for macOS.</li>
+<li>Double-click on the downloaded archive to expand the contents.</li>
+<li>Drag <code>Visual Studio Code.app</code> to the <code>Applications</code> folder, making it available in the Launchpad.</li>
+<li>Launch VS Code, Open the <code>Command Palette (⇧⌘P)</code> and type &#39;install from vsix&#39; and then press <code>Enter</code> key on keyboard.</li>
+<li>Select the vsix file under <code>ShaderlabVSCode/VSCodePlugin/</code> folder of Unity Project</li>
+<li>Restart Visual Studio Code</li>
+
+</ol>
+<h3>Running On Windows</h3>
+<ol start='' >
+<li>Import ShaderlabVSCode unity package into Unity Editor.</li>
+<li>Download the <a href='https://go.microsoft.com/fwlink/?LinkID=534107'>Visual Studio Code installer</a> for Windows. </li>
+<li>Once it is downloaded, run the installer (VSCodeSetup-version.exe). This will only take a minute.</li>
+<li>By default, VS Code is installed under C:\Program Files (x86)\Microsoft VS Code for a 64-bit machine.</li>
+<li>Launch VS Code, Open the <code>Command Palette (CTRL+SHIF+P)</code> and type &#39;install from vsix&#39; and then press <code>Enter</code> key on keyboard.</li>
+<li>Select the vsix file under <code>ShaderlabVSCode/VSCodePlugin/</code> folder of Unity Project</li>
+<li>Restart Visual Studio Code</li>
+
+</ol>
+<blockquote><p>Note: .NET Framework 4.5.2 is required for VS Code. If you are using Windows 7, please make sure .NET Framework 4.5.2 is installed.</p>
+</blockquote>
+<h2>Features</h2>
+<h3>Syntax Highlighting</h3>
+<p><img src='https://raw.githubusercontent.com/amloveyweb/amloveyweb.github.io/master/assets/images/shaderlabvscode/highlighting.jpg' alt='' referrerPolicy='no-referrer' /></p>
+<h3>Code Completion and Basic Intellisense</h3>
+<p><img src='https://raw.githubusercontent.com/amloveyweb/amloveyweb.github.io/master/assets/images/shaderlabvscode/completion.jpg' alt='' referrerPolicy='no-referrer' /></p>
+<h3>Hover Information</h3>
+<p><img src='https://raw.githubusercontent.com/amloveyweb/amloveyweb.github.io/master/assets/images/shaderlabvscode/hover.jpg' alt='' referrerPolicy='no-referrer' /></p>
+<h3>Signature Help</h3>
+<p><img src='https://raw.githubusercontent.com/amloveyweb/amloveyweb.github.io/master/assets/images/shaderlabvscode/signature.jpg' alt='' referrerPolicy='no-referrer' /></p>
+<h3>Document Symbols</h3>
+<p>Press <code>CTRL + SHIFT + o</code> on Windows or <code>CMD + SHIFT + o</code> on macOS.</p>
+<p><img src='https://raw.githubusercontent.com/amloveyweb/amloveyweb.github.io/master/assets/images/shaderlabvscode/symbol-provider.jpg' alt='' referrerPolicy='no-referrer' /></p>
+<h3>Code Snippets</h3>
+<p>Below are the snippets:</p>
+<figure><table>
+<thead>
+<tr><th>Snippets</th><th style='text-align:left;' >Description</th></tr></thead>
+<tbody><tr><td>blend1_1</td><td style='text-align:left;' >Blend One One</td></tr><tr><td>blendsa_1-sa</td><td style='text-align:left;' >Blend SrcAlpha OneMinusSrcAlpha</td></tr><tr><td>blend1_1-sa</td><td style='text-align:left;' >Blend One OneMinusSrcAlpha</td></tr><tr><td>blend1-dc_1</td><td style='text-align:left;' >Blend OneMinusDstColor One</td></tr><tr><td>blenddc_0</td><td style='text-align:left;' >Blend DstColor Zero</td></tr><tr><td>blenddc_sc</td><td style='text-align:left;' >Blend DstColor SrcColor</td></tr><tr><td>cgp</td><td style='text-align:left;' >CGPROGRAM...ENCG</td></tr><tr><td>for</td><td style='text-align:left;' >for loop</td></tr><tr><td>fallback</td><td style='text-align:left;' >Fallback</td></tr><tr><td>glp</td><td style='text-align:left;' >GLSLPROGRAM...ENCGLSL</td></tr><tr><td>if</td><td style='text-align:left;' >if { ... }</td></tr><tr><td>ifelse</td><td style='text-align:left;' >if {...} else {...}</td></tr><tr><td>incucg</td><td style='text-align:left;' >#include &quot;UnityCG.cginc&quot;</td></tr><tr><td>inclight</td><td style='text-align:left;' >#include &quot;Lighting.cginc&quot;</td></tr><tr><td>incautolight</td><td style='text-align:left;' >#include &quot;AutoLight.cginc&quot;</td></tr><tr><td>props</td><td style='text-align:left;' >Properties</td></tr><tr><td>prop2d</td><td style='text-align:left;' ><code>2D</code> type property</td></tr><tr><td>propcube</td><td style='text-align:left;' ><code>Cube</code> type property</td></tr><tr><td>propc</td><td style='text-align:left;' ><code>Color</code> type property</td></tr><tr><td>propv</td><td style='text-align:left;' ><code>Vector</code> type property</td></tr><tr><td>propf</td><td style='text-align:left;' ><code>Float</code> type property</td></tr><tr><td>proprange</td><td style='text-align:left;' ><code>Range</code> type proprety</td></tr><tr><td>region</td><td style='text-align:left;' >//#region ... //#endregion</td></tr><tr><td>region2</td><td style='text-align:left;' >//region ... //endregion</td></tr><tr><td>shader</td><td style='text-align:left;' >Shader { ... }</td></tr><tr><td>subshader</td><td style='text-align:left;' >SubShader { ... }</td></tr><tr><td>struct</td><td style='text-align:left;' >structure</td></tr><tr><td>tags</td><td style='text-align:left;' >Tags { ... }</td></tr><tr><td>tagstt</td><td style='text-align:left;' >Tags with both of RenderType and Queue is Transparent</td></tr></tbody>
+</table></figure>
+<h3>Auto Format</h3>
+<h4>Format Document</h4>
+<p>Two ways to format document:</p>
+<ol start='' >
+<li>Right click the editor are and select <strong>Format Document</strong> menu in context menu<br/></li>
+<li>Open <strong>Command Palette</strong> and type &quot;Format Document&quot;, and then press <code>ENTER</code> key on keyborad.</li>
+
+</ol>
+<h3>Misc Features</h3>
+<h4>1. Region Mark</h4>
+<p>There are two ways:</p>
+<ul>
+<li><code>//#region</code> and <code>//#endregion</code></li>
+<li><code>//region</code> and <code>//#endregion</code></li>
+
+</ul>
+<h3>Features in Unity Editor</h3>
+<h4>1.  Download Visual Studio Code</h4>
+<p>Jump to url which can download latest version of Visual Studio Code</p>
+<blockquote><p>Selection: <strong>Tools</strong> -&gt; <strong>ShaderlabVSCode</strong> -&gt; <strong>Download Visual Studio Code</strong> </p>
+</blockquote>
+<h4>2.  Update Data of ShaderlabVSCode Extension</h4>
+<p>Update data of completion, hover information or intelisense from web</p>
+<blockquote><p>Selection: <strong>Tools</strong> -&gt; <strong>ShaderlabVSCode</strong> -&gt; <strong>Update Data of VSCode Extension</strong></p>
+</blockquote>
+<h4>3. Report an Issue</h4>
+<p>Two ways to report an issue:</p>
+<ol start='' >
+<li><p>Send Email to <a href='mailto:amlovey@qq.com' target='_blank' class='url'>amlovey@qq.com</a></p>
+</li>
+<li><p>Open a issue on <a href='https://github.com/amloveyweb/amloveyweb.github.io/issues' target='_blank' class='url'>https://github.com/amloveyweb/amloveyweb.github.io/issues</a></p>
+<p> </p>
+</li>
+
+</ol>
+<h2>Release Notes</h2>
+<p><strong>V1.1.3</strong></p>
+<ul>
+<li><p>Auto Format</p>
+<ul>
+<li>use tab or spaces can be configured by <code>editor.insertSpaces</code> VSCode settings</li>
+
+</ul>
+</li>
+
+</ul>
+<p><strong>V1.1.2</strong></p>
+<ul>
+<li>Add more completions from UnityCG.cginc.</li>
+<li>Fix document symbols show incorrectly in some scenarios.</li>
+
+</ul>
+<p><strong>V1.1.1</strong></p>
+<ul>
+<li><p>Intellisense</p>
+<ul>
+<li><p>Add macros code completion support</p>
+</li>
+<li><p>Add more completion items from UnityCG.cginc, there are:</p>
+<ul>
+<li>UnityWorldSpaceViewDir</li>
+<li>UnityWorldToClipPos</li>
+<li>UnityViewToClipPos</li>
+<li>UnityWorldToViewPos</li>
+<li>UnityObjectToWorldDir</li>
+<li>UnityWorldToObjectDir</li>
+<li>UnityObjectToWorldNormal</li>
+<li>UnityWorldSpaceLightDir</li>
+
+</ul>
+</li>
+<li><p>Fix methods intellisense was broken by &#39;:&#39; in parameters</p>
+</li>
+
+</ul>
+</li>
+<li><p>Format Document</p>
+<ul>
+<li>Improve format for marcos</li>
+
+</ul>
+</li>
+<li><p>Syntax Highlighting </p>
+<ul>
+<li>Add highlight for <code>#ifdef</code> and <code>#ifndef</code></li>
+
+</ul>
+</li>
+<li><p>Add document symbols support, press <code>CTRL + SHIFT + o</code> on Windows or <code>CMD + SHIFT + o</code> on macOS to open it.</p>
+</li>
+
+</ul>
+<p><strong>V1.1.0</strong></p>
+<ul>
+<li><p>Intellisense</p>
+<ul>
+<li>Fix intellisense was broken by &quot;,&quot; in structs and fileds in some scenario</li>
+
+</ul>
+</li>
+<li><p>Format Document</p>
+<ul>
+<li>Fix format for [XX]PROGRAM..END[XX] structure</li>
+<li>Make #define to match levels</li>
+
+</ul>
+</li>
+<li><p>Experiment:</p>
+<ul>
+<li>Add .hlsl and .cg file support</li>
+
+</ul>
+</li>
+
+</ul>
+<p><strong>V1.0.9</strong></p>
+<ul>
+<li><p>Intellisense</p>
+<ul>
+<li>Fix wrong result when there are duplicate name of variables</li>
+
+</ul>
+</li>
+<li><p>Syntax Highlighting</p>
+<ul>
+<li>Add highlighing for custom functions</li>
+
+</ul>
+</li>
+
+</ul>
+<p><strong>V1.0.8</strong></p>
+<ul>
+<li><p>Format Document</p>
+<ul>
+<li>Improve format for Operators</li>
+
+</ul>
+</li>
+
+</ul>
+<p><strong>V1.0.7</strong></p>
+<ul>
+<li><p>Intellisense</p>
+<ul>
+<li>Fix Intellisense broken by &#39;+&#39;, &#39;-&#39;, &#39;*&#39;, &#39;/&#39; in some scenarios</li>
+
+</ul>
+</li>
+<li><p>Format Document</p>
+<ul>
+<li>Improve format for preprocessor directives</li>
+
+</ul>
+</li>
+<li><p>Syntax Highlighting</p>
+<ul>
+<li>Improve color of preprocessor directives</li>
+
+</ul>
+</li>
+
+</ul>
+<p><strong>V1.0.6</strong></p>
+<ul>
+<li><p>Format Document:</p>
+<ul>
+<li>fix colon formation is incorrect in #pragma line</li>
+
+</ul>
+</li>
+<li><p>Intellisense</p>
+<ul>
+<li>Fix wrong code completion result in #pragma line which is triggered by colon</li>
+<li>Update description for <code>clip</code> and <code>cos</code> cg method in code completion item</li>
+
+</ul>
+</li>
+
+</ul>
+<p><strong>V1.0.5</strong></p>
+<ul>
+<li><p>Add region mark support(Required VSCode version 1.17.0 +). ShaderlabVSCode now supports two type markers:</p>
+<ul>
+<li>//#region and //#endregion, snippet is <code>region</code></li>
+<li>//region and //endregion, snippet is <code>region2</code></li>
+
+</ul>
+</li>
+
+</ul>
+<p><strong>V1.0.4</strong></p>
+<ul>
+<li><p>Intellisense</p>
+<ul>
+<li>Add Unity defined Values support, like _Time</li>
+<li>Fix duplicate members when include same cginc files multiple times</li>
+
+</ul>
+</li>
+
+</ul>
+<p><strong>V1.0.3</strong></p>
+<ul>
+<li><p>Intellisense</p>
+<ul>
+<li>Fix bug variable broken by semicolon</li>
+
+</ul>
+</li>
+<li><p>Editor</p>
+<ul>
+<li>Improve compability</li>
+
+</ul>
+</li>
+
+</ul>
+<p><strong>V1.0.2b3</strong></p>
+<ul>
+<li><p>Auto Format:</p>
+<ul>
+<li>Add format document feature </li>
+
+</ul>
+</li>
+<li><p>Intellisense:</p>
+<ul>
+<li>supports builtin types, like half, fixed and float</li>
+<li>supports completion of fields of types</li>
+<li>supports completion of method return type</li>
+
+</ul>
+</li>
+<li><p>Bug Fixes:</p>
+<ul>
+<li>Fix bug structure fields are broken by comments</li>
+
+</ul>
+</li>
+
+</ul>
+<p><strong>V1.0.1b2</strong></p>
+<ul>
+<li>Add code snippets support</li>
+<li>Update hover infromation for some keywords</li>
+<li>Fix wrong fields data get from struct in some scenarios</li>
+<li>Fix bug that Variable and Properties Info broken by whitespace</li>
+
+</ul>
+<p><strong>v1.0.0b1</strong></p>
+<ul>
+<li>First beta release</li>
+
+</ul>
+<hr />
+<h2>For more information</h2>
+<p>Visit site <a href='http://www.amlovey.com' target='_blank' class='url'>http://www.amlovey.com</a></p>
+</body>
+</html>

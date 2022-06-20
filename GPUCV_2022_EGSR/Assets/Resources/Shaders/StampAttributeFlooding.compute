@@ -1,0 +1,241 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel StampAttributeFlooding_Init
+#pragma kernel StampAttributeFlooding_Tile
+#pragma kernel StampAttributeFlooding_JFALoop
+#pragma kernel StampAttributeFlooding_SetDispatchArgs
+
+#pragma use_dxc
+#include "../ShaderLibrary/ComputeKernelConfigs/StampAttributeFloodingComputeDefs.hlsl"
+
+// #define DEBUG_JFA_Tiling
+
+// Debug
+RWTexture2D<float4> _DebugTexture;
+
+RWTexture2D<float> _JFATex0;
+RWTexture2D<float> _JFATex1;
+RWTexture2D<float> _TileTex;
+
+StructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgsPerJFATile;
+
+ByteAddressBuffer CBuffer_BufferRawFlagsPerStamp;
+RWByteAddressBuffer CBuffer_BufferRawStampPixels;
+
+// jfa tile size == BITS_JFA_TILE_SIZE
+int2 _JFA_TexRes;
+
+int _JFA_TilesPerCol; // ceil(tex_height/tile_size), tile_size:=JFA_TILE_SIZE
+int _JFA_NumTiles; // _JFA_TilesPerCol * ceil(tex_width/tile_size)
+
+int _JFA_Step_Len; // from JFA_MAX_RADIUS ~ 1
+int _JFA_Iter_Odd; // ping-pong between 2 jfa-textures 
+
+float2 ClampCoord(float2 coord)
+{
+	return clamp(coord, 0, _JFA_TexRes.xy);
+}
+int2 ClampCoord(int2 coord)
+{
+	return clamp(coord, 0, _JFA_TexRes.xy);
+}
+uint TileCoordToIndex(uint2 tile, uint numTilePerCol)
+{
+	return tile.x * numTilePerCol + tile.y;
+}
+uint2 TileIndexToCoord(uint index, uint numTilePerCol)
+{
+	uint2 tile;
+	tile.x = index / numTilePerCol;
+	tile.y = index - tile.x * numTilePerCol;
+
+	return tile;
+}
+void TagJFATile(uint2 tile)
+{
+	_TileTex[tile.xy] = 1;
+} 
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampAttributeFlooding_Init(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+#define StampId (id.x)
+
+	const uint StampCount = CBuffer_CachedArgs_PixelCounter;
+	uint2 stampCoord =
+		DecodePixelCoord(
+			CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(StampId))
+		);
+	uint stampFlag = CBuffer_BufferRawFlagsPerStamp.Load(
+		CBuffer_BufferRaw_FlagsPerStamp_AddrAt(StampId));
+	
+	bool canvasStamp =
+		any(stampCoord.xy >= ((uint2)_ScreenParams.xy - 1u))
+		|| any(stampCoord.xy <= 1);
+
+	bool stampIsSDFSeed = GetStampFlag(STAMP_SDF, stampFlag);
+	if ((StampId < StampCount) // thread mapped to a stamp
+		&& (!canvasStamp) // not stamps on screen edges
+		&& stampIsSDFSeed // explicit control
+	){
+		float valJFAInit = InitJFASeed(stampCoord);
+
+		_JFATex0[stampCoord.xy] = valJFAInit;
+		_JFATex1[stampCoord.xy] = valJFAInit;
+
+		
+		float2 minPixel, maxPixel;
+		minPixel = ClampCoord((float2)stampCoord - (float2)(JFA_MAX_RADIUS));
+		maxPixel = ClampCoord((float2)stampCoord + (float2)(JFA_MAX_RADIUS));
+
+		uint2 minTile, maxTile;
+		minTile = ((uint2)(minPixel + .1f) >> BITS_JFA_TILE_SIZE);
+		maxTile = ((uint2)(maxPixel + .1f) >> BITS_JFA_TILE_SIZE);
+
+		// Make sure that tile-map is zeroed out, currently at vertexGenerator
+		for (uint row = minTile.x; row <= maxTile.x; ++row)
+			for (uint col = minTile.y; col <= maxTile.y; ++col)
+			{ // data race won't hurt here, just let threads write
+				TagJFATile(uint2(row, col));
+			}
+    }
+
+#undef StampId
+}
+
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StampAttributeFlooding_Tile(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+#define TileId (id.x)
+	uint tileMapVal = _TileTex[TileIndexToCoord(TileId, _JFA_TilesPerCol)];
+
+	bool cull = !((tileMapVal != 0) && (TileId < _JFA_NumTiles));
+
+	// TODO: Remember to clear the global counter!!!
+	if (groupIdx == 0) LDS_PrevBlockSum = 0;
+    GroupMemoryBarrierWithGroupSync();
+	
+	uint culledTileId = StreamCompaction_Tiling(groupIdx, (!cull));
+
+	
+	if (!cull)
+	{ // Store tile mapping
+		CBuffer_BufferRawStampPixels.Store(
+			CBuffer_StampPixels_JFATileList_AddrAt(culledTileId),
+			TileId
+		);
+	}
+#undef TileId
+}
+
+
+float JFATex_Load(int2 coord)
+{
+	float data;
+	[branch]
+	if (1 == _JFA_Iter_Odd)
+		data = _JFATex1[coord];
+	else
+		data = _JFATex0[coord];
+
+	return data;
+}
+void JFATex_Store(float data, int2 coord)
+{
+	[branch]
+	if (1 == _JFA_Iter_Odd)
+		_JFATex0[coord] = data;
+	else
+		_JFATex1[coord] = data;
+}
+
+
+[numthreads(GROUP_SIZE_JFA_LOOP, 1, 1)]
+void StampAttributeFlooding_JFALoop(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+#define CulledTileId (gIdx.x)
+	uint culledTileCount = CBuffer_JFATileCounter;
+
+	if (CulledTileId < culledTileCount)
+	{
+		MinInfo closest;
+		closest.closestCoord = 0;
+		closest.minSqrDist = MAX_F32;
+		closest.foundSeed = false;
+
+		uint tileId = CBuffer_BufferRawStampPixels.Load(
+			CBuffer_StampPixels_JFATileList_AddrAt(CulledTileId)
+		); // tile scheduled for this thread group
+		uint2 tileCoord = TileIndexToCoord(tileId, _JFA_TilesPerCol);
+
+		int2 currCoord;
+		currCoord.x = (groupIdx >> BITS_JFA_TILE_SIZE);
+		currCoord.y = groupIdx - (currCoord.x << BITS_JFA_TILE_SIZE);
+		currCoord += (tileCoord << BITS_JFA_TILE_SIZE);
+
+		
+#define JFA_STEP(offset_x, offset_y) \
+	GetMinDistancePoint(												\
+		(float2)currCoord,												\
+		JFATex_Load(ClampCoord(currCoord + int2(offset_x, offset_y))),	\
+		/*inout*/ closest												\
+	);
+
+		JFA_STEP(0, 0)
+
+		JFA_STEP(-_JFA_Step_Len, -_JFA_Step_Len)
+		JFA_STEP(+_JFA_Step_Len, +_JFA_Step_Len)
+		
+		JFA_STEP(-_JFA_Step_Len, +_JFA_Step_Len)
+		JFA_STEP(+_JFA_Step_Len, -_JFA_Step_Len)
+		
+		JFA_STEP(-_JFA_Step_Len, 0)
+		JFA_STEP(0, -_JFA_Step_Len)
+		
+		JFA_STEP(+_JFA_Step_Len, 0)
+		JFA_STEP(0, +_JFA_Step_Len)
+
+		
+		JFAData jfa;
+		jfa.coord = (uint2)(closest.closestCoord + .1f);
+		jfa.isSeed = (closest.foundSeed);
+
+		JFATex_Store(EncodeJFAData(jfa), currCoord);
+		
+#ifdef DEBUG_JFA_Tiling
+		float distCol = sqrt(closest.minSqrDist) / (float)(64.0f);
+		float2 distVec = normalize(currCoord - closest.closestCoord);
+		_DebugTexture[currCoord] = 
+			// distCol;
+			float4(distVec * .5 + .5, 0, jfa.isSeed);
+#endif
+	}
+#undef CulledTileId
+}
+
+
+[numthreads(32, 1, 1)]
+void StampAttributeFlooding_SetDispatchArgs(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	if (id.x == 0)
+	{
+		uint numGroups = CBuffer_JFATileCounter;
+		CBuffer_DispatchIndirectArgsPerJFATile[0] = numGroups;
+	}
+}

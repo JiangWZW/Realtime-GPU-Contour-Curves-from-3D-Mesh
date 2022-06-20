@@ -1,0 +1,177 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Test_ScanBlock
+#pragma kernel Test_ScanReduce
+#pragma kernel Test_ScanDownSweep
+
+#pragma use_dxc
+
+#include "../ShaderLibrary/ComputeBufferConfigs/ArgsBuffers/CBuffer_CachedArgs_View.hlsl"
+#include "../ShaderLibrary/CustomShaderInputs.hlsl"
+#include "../ShaderLibrary/ComputeAddressingDefs.hlsl"
+
+// Debug -------------------------
+StructuredBuffer<uint> CBuffer_CachedArgs;
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+// -------------------------------
+
+#define GROUP_SIZE_0 1024
+#define GROUP_SIZE_1 1024
+
+// Inputs ---------------------
+RWByteAddressBuffer CBuffer_BufferRawLookBacks; // Global Histogram
+#define SORT_TILE_SIZE GROUP_SIZE_0
+#define MAX_TILE_COUNT 1024
+#define WARP_SIZE 32
+#define WARP_COUNT (SORT_TILE_SIZE / WARP_SIZE)
+
+#define BITS_PER_SORT 5
+#define NUM_DIGIT_VALS 32 // 2^BITS_PER_SORT
+#define NUM_TILE_BUCKETS (NUM_DIGIT_VALS)
+#define NUM_GLOBAL_BUCKETS (NUM_DIGIT_VALS)
+
+groupshared uint LDS_WaveBuckets[WARP_COUNT][NUM_DIGIT_VALS];
+groupshared uint LDS_TileBuckets[NUM_DIGIT_VALS];
+groupshared uint LDS_TileDigitCounters[NUM_DIGIT_VALS];
+// ----------------------------
+
+// Software alternative of "WaveMatch(val)"
+uint WaveMatchValue(uint laneId, uint val)
+{
+	uint histoBmp = 0xffffffff;
+	[unroll]
+	for (uint bit = 0; bit < BITS_PER_SORT; ++bit)
+	{
+		// WaveActiveBallot
+		// ----------------------
+		// A uint4 containing a bitmask of the evaluation of the Boolean expression
+		// for all active lanes in the current wave.
+		// The least-significant bit(0-th bit at bitmask.x) corresponds to
+		// the lane with index zero.
+		// The bits corresponding to inactive lanes will be zero.
+		// The bits that are greater than or equal to WaveGetLaneCount will be zero.
+		uint vote = WaveActiveBallot((val >> bit) & 0x01);
+		histoBmp &= (((laneId >> bit) & 0x01) ? vote : (~vote));
+	}
+	return WaveReadLaneAt(histoBmp, val);
+}
+
+uint BlockRadixSort(uint waveId, uint laneId, uint digitVal, out uint mask)
+{
+	mask = WaveMatchValue(laneId, digitVal);
+	// lid	0	1	2	3	4	5	6	7
+	// val 	0	4	12	6	8	6	0	6
+	// ----	-	-	-	-	-	-	-	-
+	// mask	1			0		0	1	0
+	//	#1	0			0		0	0	0
+	//	#2	0			0		0	0	0
+	//	#3	0			1		1	0	1
+	//	#4	0			0		0	0	0
+	//	#5	0			1		1	0	1
+	//	#6	1			0		0	1	0
+	//	#7	0			1		1	0	1
+	uint laneDigitOffset = countbits(mask & ((1 << laneId) - 1));
+	// -->	0	0	0	0	0	1	1	2
+	uint warpDigitCount = countbits(mask);
+	// -->	2	1	1	3	1	3	2	3
+	uint warpDigitOffset = 0;
+	uint tileDigitCount = 0;
+	if (laneId == firstbitlow(mask))
+	{
+		LDS_WaveBuckets[waveId][digitVal] = warpDigitCount;
+	}
+
+	
+	GroupMemoryBarrierWithGroupSync();
+
+	
+#define DIGIT_ID waveId
+#define WAVE_ID laneId
+	if (DIGIT_ID < NUM_DIGIT_VALS && WAVE_ID < WARP_COUNT)
+	{
+		uint digitCount = LDS_WaveBuckets[WAVE_ID][DIGIT_ID];
+		warpDigitOffset = WavePrefixSum(digitCount);
+		tileDigitCount = WaveActiveSum(digitCount);
+
+		LDS_WaveBuckets[WAVE_ID][DIGIT_ID] = warpDigitOffset;
+		if (laneId == WARP_COUNT - 1)
+		{ // Last active lane in wave
+			LDS_TileBuckets[DIGIT_ID] = tileDigitCount;
+		}
+	}
+#undef DIGIT_ID
+#undef WAVE_ID
+
+
+	GroupMemoryBarrierWithGroupSync();
+
+
+#define DIGIT_ID laneId
+	if (waveId == 0 && DIGIT_ID < NUM_DIGIT_VALS)
+	{
+		uint digitCount = LDS_TileBuckets[DIGIT_ID];
+		LDS_TileBuckets[DIGIT_ID] = WavePrefixSum(digitCount);
+		LDS_TileDigitCounters[DIGIT_ID] = digitCount;
+	}
+#undef DIGIT_ID
+
+
+	GroupMemoryBarrierWithGroupSync();
+	
+	
+	return LDS_TileBuckets[digitVal] + LDS_WaveBuckets[waveId][digitVal] + laneDigitOffset;
+}
+
+void StoreGlobalHistogram(
+	RWByteAddressBuffer globalHisto, uint bufferOffset,
+	uint tileId, uint digitVal, uint digitCount)
+{
+	uint strAddr = bufferOffset + 
+		((digitVal * MAX_TILE_COUNT + tileId) << BITS_WORD_OFFSET);
+	globalHisto.Store(strAddr, digitCount);
+}
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void Test_ScanBlock(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID
+)
+{
+	if (groupIdx < NUM_DIGIT_VALS)
+	{
+		LDS_TileBuckets[groupIdx] = 0;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	uint waveId = groupIdx / WaveGetLaneCount();
+	uint laneId = WaveGetLaneIndex();
+	
+	// Note: DXC doesn't support implicit type conversion.
+	uint rand = WangHash(id.x) % 3;
+	uint mask = 0;
+	uint res = BlockRadixSort(waveId, laneId, rand, mask);
+	
+	CBuffer_BufferRawDebug.Store(id.x << 3, uint2(rand, res));
+}
+
+
+[numthreads(GROUP_SIZE_1, 1, 1)]
+void Test_ScanReduce(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID
+)
+{
+	
+}
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void Test_ScanDownSweep(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID
+)
+{
+}
+

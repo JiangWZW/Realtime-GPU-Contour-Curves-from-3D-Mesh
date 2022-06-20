@@ -1,0 +1,392 @@
+﻿// #pragma enable_d3d11_debug_symbols
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ContourSetup_Indirection
+#pragma kernel ContourSetup_Rasterization
+
+#include "../ShaderLibrary/ComputeKernelConfigs/SetupComputeDefs.hlsl"
+
+float4 _HiZResolution;
+Texture2D<float> _HiZPyramidTexture;
+ByteAddressBuffer CBuffer_BufferRawPerEdge;
+ByteAddressBuffer CBuffer_BufferRawFlagsPerEdge;
+
+RWByteAddressBuffer CBuffer_BufferRawContourToEdge;
+RWByteAddressBuffer CBuffer_BufferRawContourToSegment;
+RWByteAddressBuffer CBuffer_BufferRawRasterDataPerContour;
+RWByteAddressBuffer CBuffer_BufferRawFlagsPerContour;
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+RWStructuredBuffer<uint> CBuffer_DispatchIndirectArgsPerMeshContour;
+RWStructuredBuffer<uint> CBuffer_DispatchIndirectArgsTwoMeshContour;
+
+RWByteAddressBuffer CBuffer_BufferRawLookBacks;
+
+// debug
+// #define DEBUG_CLIP
+#define RENDER_CANVAS
+
+// LDS
+groupshared uint LDS_NumGroupsNextKernel;
+groupshared uint LDS_NumGroupsThisKernel;
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void ContourSetup_Indirection(
+    uint3 id : SV_DispatchThreadID,
+    uint gIdx : SV_GroupIndex)
+{
+    const uint edgeIndex = id.x;
+    
+    // Scan Result == Index where we should write into new buffer
+    uint ldAddr = CBuffer_BufferRawPerEdge_AddrAt(edgeIndex);
+    const uint scanIdxCurr = CBuffer_BufferRawPerEdge.Load(ldAddr);
+    ldAddr = CBuffer_BufferRawFlagsPerEdge_AddrAt(edgeIndex);
+    const uint edgeFlag = CBuffer_BufferRawFlagsPerEdge.Load(ldAddr);
+
+    // Load values from LDS cache
+	const uint contourCount = CBuffer_CachedArgs_ContourCounter;
+	
+    // Compute contour flag
+    const bool isContour = isContourEdge(edgeFlag);
+
+    if (isContour)
+    {
+        // Store contour edge data
+        uint strAddr = CBuffer_BufferRawContourToEdge_AddrAt(scanIdxCurr);
+        CBuffer_BufferRawContourToEdge.Store(strAddr, edgeIndex);
+        strAddr = CBuffer_BufferRawFlagsPerContour_AddrAt(scanIdxCurr);
+        CBuffer_BufferRawFlagsPerContour.Store(strAddr, edgeFlag >> 1);
+    }
+
+    if (edgeIndex == 0)
+    {
+        // Set dispatch args,
+        // which is needed in next kernel.
+        uint workSize = contourCount;
+#ifdef RENDER_CANVAS
+        workSize += 4;
+#endif
+        uint numGroups = ComputeNumGroups(workSize, GROUP_SIZE_1, BITS_GROUP_SIZE_1);
+    	CBuffer_DispatchIndirectArgsPerMeshContour[0] = numGroups;
+
+        // Next group dispatch count
+        CBuffer_CachedArgs_NumGroups(1) = numGroups;
+    }
+}
+
+// #define DEBUG_CLIP 1
+float4x4 CMatrix_VP_Initial;
+
+[numthreads(GROUP_SIZE_1, 1, 1)]
+void ContourSetup_Rasterization(
+    uint3 id : SV_DispatchThreadID,
+    uint groupIndex : SV_GroupIndex)
+{
+    uint4x2 rasterData;
+    
+    ////////////////////////////////////////////////////////////
+    // Load edge id & vertex ids
+    // ---------------------------------------------------------
+    uint ContourCount = CBuffer_CachedArgs_ContourCounter;
+    const uint contourIdx = id.x; // contour index
+    bool isValidThread = contourIdx < ContourCount;
+#ifdef RENDER_CANVAS
+	const bool isCanvasEdge = ContourCount <= contourIdx && contourIdx < ContourCount + 4;
+    const uint canvasEdgeId = contourIdx - ContourCount;
+
+	ContourCount += 4;
+    isValidThread = isValidThread || isCanvasEdge;
+#endif
+	
+    uint ldAddr;
+    // contour index --> contour flag
+    ldAddr = CBuffer_BufferRawFlagsPerContour_AddrAt(contourIdx);
+    uint contourFlag = CBuffer_BufferRawFlagsPerContour.Load(ldAddr);
+    
+    // contour index --> edge index
+    ldAddr = CBuffer_BufferRawContourToEdge_AddrAt(contourIdx);
+    uint edgeIdx = CBuffer_BufferRawContourToEdge.Load(ldAddr);
+    
+    // edge index --> vert indices
+    ldAddr = CBuffer_EVList_AddrAt(edgeIdx);
+    uint2 vertIds = CBuffer_EVList.Load2(ldAddr);
+    // Swap vert order if 2nd adj face is front-facing,
+    // -- which has inverted vertex order 
+    // -- compared to the original order of current edge from EVList
+    vertIds.xy =
+        (ShouldSwapWindingOrder(contourFlag)) ? vertIds.yx : vertIds.xy;
+    
+
+
+    ///////////////////////////////////////////////////////////////////////////
+    //        Camera Transform, Frustum Clipping, Occlusion Culling
+    // -------------------------------------------------------------------------
+    // Load vertex position, transform into homogenous space for clipping
+    // vert index --> vert position
+    float4 vertPos0 = float4(CBuffer_VPList[vertIds.x].xyz, 1);
+    float4 vertPos1 = float4(CBuffer_VPList[vertIds.y].xyz, 1);
+    float3 vertPos0_OS = vertPos0.xyz;
+    float3 vertPos1_OS = vertPos1.xyz;
+	
+    // OS --> VS
+    // -----------------------------------------------------------------
+    vertPos0 = mul(CMatrix_V, mul(CMatrix_M, vertPos0));
+    vertPos1 = mul(CMatrix_V, mul(CMatrix_M, vertPos1));
+
+    // View Space Normal
+    float4 vertNormal0 = float4(
+        normalize(mul((float3x3)CMatrix_I_TMV, CBuffer_VNList[vertIds.x].xyz)), 1.0f
+    );
+    float4 vertNormal1 = float4(
+        normalize(mul((float3x3)CMatrix_I_TMV, CBuffer_VNList[vertIds.y].xyz)), 1.0f
+	);
+    vertNormal0.xyz += vertPos0.xyz; // View Space Pos
+    vertNormal1.xyz += vertPos1.xyz;
+	
+    // VS --> HClip
+    // --------------------------------------------------------------------
+    // Proven fact: CMatrix_VP == UNITY_MATRIX_VP(with some precision loss)
+#ifdef DEBUG_CLIP // use VP matrix in 1st frame if we want to check clipping
+    vertPos0 = mul(CMatrix_VP_Initial, vertPos0); // HClip coord  
+    vertPos1 = mul(CMatrix_VP_Initial, vertPos1); // HClip coord
+#else
+    vertPos0 = mul(CMatrix_P,          vertPos0); // HClip coord  
+    vertPos1 = mul(CMatrix_P,          vertPos1); // HClip coord
+#endif /* DEBUG_CLIP */
+
+	// Normal computation
+    vertNormal0 = mul(CMatrix_P, vertNormal0);
+    vertNormal0.xy = normalize(
+        vertNormal0.xy / vertNormal0.w - 
+        vertPos0.xy / vertPos0.w
+    );
+    vertNormal1 = mul(CMatrix_P, vertNormal1);
+    vertNormal1.xy = normalize(
+        vertNormal1.xy / vertNormal1.w -
+        vertPos1.xy / vertPos1.w
+    );
+    vertNormal0.xy = normalize(vertNormal0.xy + vertNormal1.xy);
+    // vertNormal0.y *= -1; Here we do not need to flip y.
+	// All the "Flip-y" logic comes from the goddamn piece of code in
+	// "HClipToNDC" defined at "SetupComputeDefs.hlsl".
+
+
+	
+    // HClip --> HClip(Clipped) 
+    // -----------------------------------------------------------------------------
+    bool reject, inside;
+    float2 interpolate = FrustumClipPerContour(
+        vertPos0, vertPos1, // in
+        reject, inside // out
+    );
+    vertPos0 = lerp(vertPos0, vertPos1, interpolate.x);
+    vertPos1 = lerp(vertPos0, vertPos1, interpolate.y);
+    float2 wHClip = float2(vertPos0.w, vertPos1.w);
+
+    // HClip(Clipped)->NDC
+    // -----------------------------------------------------------------------------
+    // .w component is preserved & for later use
+    vertPos0.xyz = reject ? float3(0, 0, 0) : HClipToNDC(vertPos0);
+    vertPos1.xyz = reject ? float3(0, 0, 0) : HClipToNDC(vertPos1);
+
+#ifdef RENDER_CANVAS
+	// Bypass canvas edges
+    reject = (!isCanvasEdge) && reject;
+    inside = isCanvasEdge || inside;
+#endif
+	// Hi-Z Occlusion Culling
+    // -----------------------------------------------------------------------------
+    bool occlusionCulled = false;
+    // OcclusionCullPerContour(
+    //     vertPos0.xy, vertPos1.xy,
+    //     max(vertPos0.z, vertPos1.z),
+    //     /* _HiZResolution.xy */float2(1024, 1024),
+    //     _HiZPyramidTexture
+    // );
+
+    // NDC->Viewport
+    // -------------------------------------------------------------------------
+    float4 fragsPos = // easier to swizzle this way
+        // X2 Up-Sample Happens here
+        float4(NDCToViewport(vertPos0.xy).xy, NDCToViewport(vertPos1.xy).xy);
+#ifdef RENDER_CANVAS
+	if (isCanvasEdge)
+	{
+        wHClip = float2(1, 1);
+        fragsPos = float4(
+	        _CanvasPointsHC[canvasEdgeId].xy,
+	        _CanvasPointsHC[(canvasEdgeId + 1) & 3].xy
+        );
+        vertNormal0.xy = _CanvasNormalsSS[canvasEdgeId];
+	}
+#endif
+
+	bool isTopLeftEdge = isTopLeft(fragsPos.xy, fragsPos.zw);
+
+    // Compute fragment(== segment, in our context) count
+    // Is edge X or Y major?
+    // \          /  | A & C: X-Major
+    //   \   B  /    | B & D: Y-Major 
+    //     \  /      | 
+    //  A   O    C   | 
+    //    /    \     | 
+    //  /   D    \   | 
+    ///            \ | 
+    float2 dxdy = abs(fragsPos.zw - fragsPos.xy);
+    bool isXMajorEdge = (dxdy.y < dxdy.x);
+
+    bool2 isLowerAtP0 = fragsPos.xy < fragsPos.zw;
+    bool begFromP0 = isXMajorEdge ? isLowerAtP0.x : isLowerAtP0.y;
+
+    fragsPos = begFromP0    ? fragsPos.xyzw : fragsPos.zwxy;
+	
+    // fragsPos = isXMajorEdge ? fragsPos.xyzw : fragsPos.yxwz;
+    // fragsPos.x = floor(fragsPos.x);
+    // fragsPos.w = ceil(fragsPos.w);
+    // fragsPos = isXMajorEdge ? fragsPos.xyzw : fragsPos.yxwz;
+    //
+    // dxdy = abs(fragsPos.zw - fragsPos.xy);
+	
+    // 'cause it will destroy segment continuity in contour
+    // Diamond Culling
+    // fragsPos = DiamondCullLine(fragsPos, isXMajorEdge, begFromP0); 
+    // // Update dxdy after diamond culling
+    // dxdy = abs(fragsPos.zw - fragsPos.xy);
+
+    // Compute fragment count according to X or Y major
+    // Only accept contours that passes frustum clipping 
+    uint fragCount = reject ? 0 : (uint) max(0, ceil(max(dxdy.x, dxdy.y) + 0.0001));
+    // HiZ Occlusion Culling
+    // fragCount = occlusionCulled ? 0 : fragCount;
+    // Clean extra slots with specified value(0xffff ffff)
+    fragCount = (isValidThread) ? fragCount : 0;
+
+    // *************************************************************************
+    //                  Compute & Encode Per-Contour Raster Data
+    uint strAddr;
+	
+    if (isValidThread)
+    {
+        // Only store data when this thread actually maps to a contour
+        // In case that redundant thread overwrite trash data into sub buffers
+        // For example:
+        //  T0 T1 T2 T3  T4 | in a thread group consists of threads T0~T4,
+        //  D0 D1 D2 D3  D4 | #contour = 4, #threads = 5, D4 is trash data
+        // [D0 D1 D2 D3][D4 -- -- --] | Then 1st slot in Subbuff 1 gets
+        // |<Subbuff 0>||<Subbuff 1>| | polluted by D4 from T4
+
+        //----------------//
+        // Sub Buffer # 0 //
+        //----------------//
+        // Originally, we swapped verts so that P0->P1 follows CW order on screen; 
+        // but if edge begins raster process from P1, then P0 and P1 gets swapped again;
+        float4 fragPosFixed = fragsPos;
+        fragPosFixed = float4(
+            ViewportToNDC(fragPosFixed.xy),
+            ViewportToNDC(fragPosFixed.zw)
+        );
+        RASTER_DATA_BEG_END(rasterData) = 
+            uint4(
+                PackR16G16(fragPosFixed.xy),
+                PackR16G16(fragPosFixed.zw),
+                asuint(vertNormal0.xy)
+            );
+        RASTER_DATA_HCLIP_W(rasterData) = asuint(
+            begFromP0 ? wHClip.xy : wHClip.yx
+        );
+        bool isEdgeCW = begFromP0;
+        uint rasterFlag = ENCODE_RASTER_FLAG(
+            isTopLeftEdge, // Top/Left edge
+            isXMajorEdge, // X-Major(length in X > in Y)?
+            (!reject) && (!inside), // Is this edge clipped?
+            // -------------------------------------------------------
+            // Note: CW flag has a messy setup, see comment above,
+            // or "CBuffer_BufferRawRasterDataPerContour.hlsl" at
+            // line 122, if more details is needed...
+            begFromP0, // Do beg->end follows CW order?
+            // -------------------------------------------------------
+            occlusionCulled // Is this edge culled by hiz test?
+        );
+        RASTER_DATA_FLAG(rasterData) = rasterFlag;
+        RASTER_DATA_SEG_COUNT(rasterData) = fragCount;
+        
+
+        strAddr = CBuffer_BufferRawRasterDataPerContour_AddrAt(contourIdx);
+        CBuffer_BufferRawRasterDataPerContour.Store4(strAddr, rasterData._11_21_31_41);
+        strAddr = MoveAddrSingleBlock(strAddr);
+        CBuffer_BufferRawRasterDataPerContour.Store4(strAddr, rasterData._12_22_32_42);
+
+
+        //----------------//
+        // Sub Buffer # 1 //
+        //----------------//
+    	// Data needed for temporal reprojection,
+    	// including OS position, and view space z of 2 edge vertices.
+        if (!begFromP0)
+        { // Swap vertex order, if contour line begins from vert1
+            float3 temp0 = vertPos0_OS;
+            vertPos0_OS = vertPos1_OS;
+            vertPos1_OS = temp0;
+        	
+            wHClip.xy = wHClip.yx;
+        }
+        strAddr = CBuffer_BufferRawRasterDataPerContour_II_AddrAt(contourIdx);
+        CBuffer_BufferRawRasterDataPerContour.Store4(
+            strAddr, asuint(float4(vertPos0_OS.xyz, -wHClip[0])) // wHClip = -zView
+        );
+        strAddr = MoveAddrSingleBlock(strAddr);
+        CBuffer_BufferRawRasterDataPerContour.Store4(
+            strAddr, asuint(float4(vertPos1_OS.xyz, -wHClip[1]))
+        );
+    }
+    // *************************************************************************
+
+    contourFlag |= (((uint)reject) << 1);
+    strAddr = CBuffer_BufferRawFlagsPerContour_AddrAt(contourIdx);
+    CBuffer_BufferRawFlagsPerContour.Store(strAddr, contourFlag);
+
+    // Note: This buffer will be used for scan in next kernel
+    // make sure that extra slots are cleaned up
+    strAddr = CBuffer_BufferRawContourToSegment_AddrAt(contourIdx);
+    uint fragCountCleaned = isValidThread ? fragCount : 0;
+    CBuffer_BufferRawContourToSegment.Store(strAddr, fragCountCleaned);
+
+    ////////////////////////////////////////////////////////////////
+    // Prepare for Next Kernel
+    if (groupIndex.x == 0)
+    {
+        // Compute #of dispatched thread groups
+        // Each thread process x2 pieces of data
+        uint workSize = ContourCount; // (ContourCount + 1) >> 1;
+        uint numGroups = ComputeNumGroups(
+            workSize, GROUP_SIZE_NEXT, BITS_GROUP_SIZE_NEXT
+        );
+        if (id.x == 0)
+        {
+            // Clear cached arguments
+            CBuffer_CachedArgs_SegmentCounter = 0;
+            CBuffer_CachedArgs_ScanCounter(0) = 0;
+            CBuffer_CachedArgs_ScanCounter(1) = 0;
+            CBuffer_CachedArgs_NumGroups(0) = numGroups;
+        }
+
+        LDS_NumGroupsThisKernel = CBuffer_CachedArgs_NumGroups(1);
+
+        // Cache #of groups, useful in next kernel
+        LDS_NumGroupsNextKernel = numGroups;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint numGroupsNext = LDS_NumGroupsNextKernel;
+
+    // Logic to clean look-back table for scan ops in next kernel
+    if (id.x < max(SCAN_MAX_NUM_BLOCKS, numGroupsNext))
+    {
+        CBuffer_BufferRawLookBacks.Store(
+            id.x << 2,
+            0u
+        );
+    }
+}

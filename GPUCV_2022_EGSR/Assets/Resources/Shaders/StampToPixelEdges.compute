@@ -1,0 +1,320 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel StampToPixelEdges_StampToEdges
+#pragma kernel StampToPixelEdges_CompactEdges
+#pragma kernel StampToPixelEdges_InitLinks
+
+#define INIT_KERNELS
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourTracingComputeDefs.hlsl"
+
+// #define DEBUG_STAMP_TO_EDGES
+// #define DEBUG_BUILD_ADJACENCY
+ 
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+ByteAddressBuffer CBuffer_BufferRawStampGBuffer;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+Texture2D<uint> _PerPixelSpinLockTex;
+
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawStampLinkage;
+RWByteAddressBuffer CBuffer_BufferRawFlagsPerStamp;
+
+RWStructuredBuffer<uint> CBuffer_StructuredTempBuffer;
+
+// Shared memory structures for scan
+groupshared uint LDS_GroupTicket;
+groupshared uint LDS_BufferPerData[LDS_SCAN_TABLE_SIZE];
+groupshared uint LDS_LookBackCache[LOOKBACK_CACHE_SIZE];
+groupshared uint LDS_PrevGroupAggregate;
+ 
+uint SumOp(uint a, uint b)
+{
+	return (a + b);
+}
+
+[numthreads(GROUP_SIZE_0,1,1)]
+void StampToPixelEdges_StampToEdges(
+	uint3 id : SV_DispatchThreadID)
+{
+	const uint StampCount = CBuffer_CachedArgs_PixelCounter;
+	const uint StampID = id.x;
+
+	uint2 stampCoord = DecodePixelCoord(
+		CBuffer_BufferRawStampPixels.Load(
+			CBuffer_BufferRawStampPixels_AddrAt(StampID)));
+
+	uint3x3 boxSamples =
+		SampleBox3x3_R_U32(_PerPixelSpinLockTex, (int2)stampCoord, _ScreenParams.xy);
+	uint boxCode = ExtractNeighborBinaryCode_Box3X3_R_U32(boxSamples);
+	bool deletedStamp = boxSamples.CenterCenter < 0.1; // fp precision is bad as hell
+
+	boxCode = ~boxCode; // flip black & white to fit definition in image-processing.hlsl
+	uint4 edgeData = deletedStamp ?
+		INVALID_STAMP_EDGE.xxxx :
+		ComputeStampEdgeDataX4(StampID, boxCode);
+
+	//     0    
+	//   *-->*  
+	// 3 | P | 1
+	//   *<--*  
+	//     2    
+	bool4 edgeOutOfRange = bool4(
+		stampCoord.y == (uint)_ScreenParams.y - 1,
+		stampCoord.x == (uint)_ScreenParams.x - 1,
+		stampCoord.y == 0,
+		stampCoord.x == 0
+	);
+	edgeData.x = edgeOutOfRange.x ? INVALID_STAMP_EDGE : edgeData.x;
+	edgeData.y = edgeOutOfRange.y ? INVALID_STAMP_EDGE : edgeData.y;
+	edgeData.z = edgeOutOfRange.z ? INVALID_STAMP_EDGE : edgeData.z;
+	edgeData.w = edgeOutOfRange.w ? INVALID_STAMP_EDGE : edgeData.w;
+
+	bool innerStamp = all(edgeData == INVALID_STAMP_EDGE);
+
+	if (StampID < StampCount)
+	{
+		CBuffer_BufferRawPixelEdgeData.Store4(
+			CBuffer_PixelEdgeData_StampToEdges_AddrAt(StampID, 0),
+			edgeData
+		);
+
+		// Update stamp state
+		uint flagAddr = CBuffer_BufferRaw_FlagsPerStamp_AddrAt(
+			StampID
+		);
+		uint flag = CBuffer_BufferRawFlagsPerStamp.Load(flagAddr);
+		SetStampFlag(STAMP_CONTOUR, (!innerStamp), flag);
+		CBuffer_BufferRawFlagsPerStamp.Store(flagAddr, flag);
+	}
+	
+	if (id.x == 0)
+	{
+		CBuffer_CachedArgs_PixelEdgeCounter = 0;
+	}
+}
+
+void CheckAndStoreEdgeData(uint edgeData, uint baseAddr, inout uint offset)
+{
+	if (edgeData != INVALID_STAMP_EDGE)
+	{
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_EdgesToStamp_AddrAt(baseAddr + offset),
+			edgeData
+		);
+		offset++;
+	}
+}
+
+uint StampToEdgePointer(uint edgeData, uint edgeIdStart, inout uint offset)
+{
+	bool mask = (edgeData != INVALID_STAMP_EDGE);
+
+	uint res = mask ? edgeIdStart + offset : INVALID_STAMP_EDGE;
+
+	offset += mask;
+
+	return res;
+}
+
+WorkEfficientScan_Block(LDS_BufferPerData, SumOp, PixelEdgeCompaction)
+
+
+[numthreads(GROUP_SIZE_1, 1, 1)]
+void StampToPixelEdges_CompactEdges(
+	uint3 id : SV_DispatchThreadID,
+	uint groupId : SV_GroupIndex,
+	uint3 gId : SV_GroupID)
+{
+	const uint StampCount = CBuffer_CachedArgs_PixelCounter;
+	// scanAddr:
+	// -- .x: Global_scanAddr0, .y: Global_scanAddr1, 
+	// -- .z: LDS_scanAddr0, .w: LDS_scanAddr1
+	const uint4 scanAddrs = ComputeWorkEffecientScanIndices(groupId, gId.x);
+
+	uint4 edgeDataA, edgeDataB;
+	edgeDataA = CBuffer_BufferRawPixelEdgeData.Load4(
+		CBuffer_PixelEdgeData_StampToEdges_AddrAt(scanAddrs.x, 0)
+	);
+	edgeDataB = CBuffer_BufferRawPixelEdgeData.Load4(
+		CBuffer_PixelEdgeData_StampToEdges_AddrAt(scanAddrs.y, 0)
+	);
+	uint2 dataABInitial = uint2(
+		CountStampEdges(edgeDataA),
+		CountStampEdges(edgeDataB)
+	);
+
+	bool2 isValidDataAB = bool2(
+		// is valid thread
+		(scanAddrs.x < StampCount),
+		(scanAddrs.y < StampCount)
+	);
+	// Clear invalid data from invalid threads
+	dataABInitial.x = isValidDataAB.x ? dataABInitial.x : 0;
+	dataABInitial.y = isValidDataAB.y ? dataABInitial.y : 0;
+
+	// Apply block-level prefix sum
+	uint2 blockExcSum = ScanBlock_PixelEdgeCompaction(
+		groupId, gId.x, GROUP_SIZE_1, DATA_SIZE, // Group Indexing
+		scanAddrs.z, scanAddrs.w, // Address in LDS
+		dataABInitial.x, dataABInitial.y // Initial Data
+	);
+
+	uint prevBlockAggregate = 0;
+	if (groupId == GROUP_SIZE_1 - 1)
+	{
+		InterlockedAdd(
+			CBuffer_CachedArgs_PixelEdgeCounter,
+			blockExcSum.y + dataABInitial.y,
+			LDS_PrevGroupAggregate
+		);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	prevBlockAggregate = LDS_PrevGroupAggregate;
+
+	uint2 prefixSum = blockExcSum.xy + prevBlockAggregate.xx;
+
+	uint offset;
+#define STORE_EDGES_TO_STAMP(edgeData, isValidData, baseAddr, storeCount)    		\
+    [branch]                                                  		\
+    if (storeCount == 4 && isValidData)                       		\
+    {                                                         		\
+	    CBuffer_BufferRawPixelEdgeData.Store4(                   	\
+		    CBuffer_PixelEdgeData_EdgesToStamp_AddrAt(baseAddr),	\
+		    edgeData                                                \
+	    );                                                       	\
+    }                                                         		\
+    else if (isValidData)                                     		\
+    {                                                         		\
+	    offset = 0;                                              	\
+	    CheckAndStoreEdgeData(edgeData.x, baseAddr, offset);        \
+	    CheckAndStoreEdgeData(edgeData.y, baseAddr, offset);        \
+	    CheckAndStoreEdgeData(edgeData.z, baseAddr, offset);        \
+	    CheckAndStoreEdgeData(edgeData.w, baseAddr, offset);        \
+    }
+
+	
+	uint4 stampToEdges;
+#define STORE_STAMP_TO_EDGES(edgeData, isValidData, edgeIdStart, stampId)		\
+	if (isValidData)																\
+	{																				\
+		offset = 0;																	\
+		stampToEdges = uint4(														\
+	        StampToEdgePointer(edgeData.x, edgeIdStart, offset),					\
+	        StampToEdgePointer(edgeData.y, edgeIdStart, offset),					\
+	        StampToEdgePointer(edgeData.z, edgeIdStart, offset),					\
+	        StampToEdgePointer(edgeData.w, edgeIdStart, offset)						\
+        );																			\
+        CBuffer_BufferRawPixelEdgeData.Store4(										\
+			CBuffer_PixelEdgeData_StampToEdges_AddrAt(stampId, 0),					\
+			stampToEdges															\
+		);																			\
+    }
+
+	bool validFlag = isValidDataAB.x;
+	uint storeCount = dataABInitial.x;
+	uint firstEdgeId = prefixSum.x;
+	uint stampId = scanAddrs.x;
+	STORE_EDGES_TO_STAMP(edgeDataA, validFlag, firstEdgeId, storeCount)
+	STORE_STAMP_TO_EDGES(edgeDataA, validFlag, firstEdgeId, stampId)
+
+	validFlag = isValidDataAB.y;
+	storeCount = dataABInitial.y;
+	firstEdgeId = prefixSum.y;
+	stampId = scanAddrs.y;
+	STORE_EDGES_TO_STAMP(edgeDataB, validFlag, firstEdgeId, storeCount)
+	STORE_STAMP_TO_EDGES(edgeDataB, validFlag, firstEdgeId, stampId)
+}
+
+
+uint QueryStampIdFromCoord(float2 Coord)
+{
+	return _PerPixelSpinLockTex.Load(int3((int2)Coord, 0)) - 1;
+}
+
+
+[numthreads(GROUP_SIZE_2, 1, 1)]
+void StampToPixelEdges_InitLinks(
+	uint3 id : SV_DispatchThreadID,
+	uint groupId : SV_GroupIndex,
+	uint3 gId : SV_GroupID)
+{
+#define EdgeId (id.x)
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+
+	uint edgeData = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_EdgesToStamp_AddrAt(EdgeId)
+	);
+	uint prevDir = GET_STAMP_EDGE_DIR_PREV(edgeData);
+	uint currDir = GET_STAMP_EDGE_DIR_CURR(edgeData);
+	uint nextDir = GET_STAMP_EDGE_DIR_NEXT(edgeData);
+	uint stampID = GET_STAMP_EDGE_STAMP_ID(edgeData);
+	
+	// Find prev & next stamp coord & ID
+	float2 stampCoord =
+		(float2)DecodePixelCoord(
+			CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(stampID))
+		);
+
+	// Fetch next & prev edge data items
+	float2 offsetToStamp;
+	offsetToStamp = MoveAtNextStamp(currDir, nextDir);
+	uint nextStampID = QueryStampIdFromCoord(offsetToStamp + stampCoord);
+	uint nextEdgeID = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_StampToEdges_AddrAt(nextStampID, nextDir));
+
+	offsetToStamp = MoveAtPrevStamp(currDir, prevDir);
+	uint prevStampID = QueryStampIdFromCoord(offsetToStamp + stampCoord);
+	uint prevEdgeID = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_StampToEdges_AddrAt(prevStampID, prevDir)
+	);
+
+	// Use next & prev edge data to init linkage info
+	if (EdgeId < EdgeCount)
+	{
+		CBuffer_BufferRawStampLinkage.Store2(
+			CBuffer_BufferRawEdgeLinkage_AddrAt(ORIGINAL_STAMP_LINKAGE, EdgeId),
+			uint2(prevEdgeID, nextEdgeID)
+		);
+		CBuffer_BufferRawStampLinkage.Store2(
+			CBuffer_BufferRawEdgeLinkage_AddrAt(PINGPONG_STAMP_LINKAGE_0, EdgeId),
+			EncodeMaxIDLink(
+				EncodeEdgeMaxID((uint2)stampCoord, currDir),
+				nextEdgeID
+			)
+		);
+
+		// For testing pointer jumping optimization
+		CBuffer_BufferRawStampLinkage.Store(
+			CBuffer_BufferRawEdgeIndirect_AddrAt(0, EdgeId),
+			EdgeId
+		);
+
+#ifdef DEBUG_BUILD_ADJACENCY
+		float2 adjStampCoord = stampCoord + MoveAtOppositeStamp(currDir);
+		float2 edgeDir = /*offsetToStamp;*/
+			normalize(
+				MoveDir[currDir] + 
+				(MoveDir[prevDir] + MoveDir[nextDir]) * 0.5
+			);
+		float2 stampDir = 
+			asfloat(
+				CBuffer_BufferRawStampGBuffer.Load2(
+					CBuffer_BufferRawStampTangent_AddrAt(stampID)));
+		// float orient = edgeDir.x * stampDir.y - edgeDir.y * stampDir.x;
+		float orient = dot(edgeDir, stampDir);
+		_DebugTexture[adjStampCoord] = 
+			float4(prevEdgeID, EdgeId, nextEdgeID, 1);
+#endif
+	}
+
+	// Clear scan counter, used in later pointer jumping process
+	if (EdgeId < 128)
+	{
+		CBuffer_StructuredTempBuffer[EdgeId] = (EdgeId == 0 ? EdgeCount : 0);
+	}
+}

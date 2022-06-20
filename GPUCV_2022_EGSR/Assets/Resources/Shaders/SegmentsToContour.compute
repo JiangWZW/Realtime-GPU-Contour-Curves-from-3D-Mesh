@@ -1,0 +1,125 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel SegmentsToContour_UpSweep
+#pragma kernel SegmentsToContour_Reduce
+#pragma kernel SegmentsToContour_DwSweep
+
+#define SCAN_BLOCK_SIZE GROUP_SIZE_0
+#include "../ShaderLibrary/ComputeKernelConfigs/SegmentSetupUpdatedComputeDefs.hlsl"
+
+#pragma use_dxc
+
+RWByteAddressBuffer CBuffer_BufferRawLookBacks;
+
+ByteAddressBuffer CBuffer_BufferRawContourToSegment;
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+RWByteAddressBuffer CBuffer_BufferRawSegmentsToContour;
+RWByteAddressBuffer CBuffer_BufferRawRasterDataPerSeg;
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+
+#define Max(x, y) (max((x), (y)))
+
+//////////////////////////////////////////////////////////////////////////
+// --- Custom inputs ---
+#define REDUCED_BUFFER CBuffer_BufferRawLookBacks
+#define SCAN_BUFFER CBuffer_BufferRawRasterDataPerSeg
+
+#define SCAN_FUNCTION_TAG SegmentSetup
+#define SCAN_SCALAR_TYPE uint
+#define SCAN_OP Max
+#define SCAN_ZERO_VAL 0
+
+DECLARE_TREE_SCAN_CACHE
+DECLARE_TREE_SCAN_INDEXING_FUNCTION
+
+DECLARE_TREE_SCAN_FUNC_BLOCK
+DECLARE_TREE_SCAN_FUNC_DEVICE
+DECLARE_TREE_SCAN_FUNC_DWSWEEP
+
+uint GetData(uint segmentId, uint segmentCount)
+{
+	return segmentId >= segmentCount ? SCAN_ZERO_VAL :
+		CBuffer_BufferRawSegmentsToContour.Load(
+			CBuffer_BufferRawSegmentsToContour_AddrAt(segmentId));
+}
+void StoreData(uint segmentId, uint segmentCount, uint data)
+{
+	if (segmentId < segmentCount)
+	{
+		CBuffer_BufferRawSegmentsToContour.Store(
+			CBuffer_BufferRawSegmentsToContour_AddrAt(segmentId),
+			data
+		);
+	}
+}
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void SegmentsToContour_UpSweep(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+#define ScanItemID (id.x)
+	uint SegmentCount = CBuffer_CachedArgs_SegmentCounter;
+
+	uint4 scanAddrs = GetTreeScanIndices(groupIdx, gIdx);
+	uint dataA = GetData(scanAddrs.x, SegmentCount);
+	uint dataB = GetData(scanAddrs.y, SegmentCount);
+	
+	uint2 res = TreeScanBlockExcSegmentSetup(
+		groupIdx, gIdx, dataA, dataB 
+	);
+	
+
+	if (groupIdx == SCAN_BLOCK_SIZE - 1)
+	{
+		REDUCED_BUFFER.Store(gIdx.x << 2, SCAN_OP(res.y, dataB));
+	}
+	SCAN_BUFFER.Store(scanAddrs.x << 2, res.x);
+	SCAN_BUFFER.Store(scanAddrs.y << 2, res.y);
+}
+
+[numthreads(1024, 1, 1)]
+void SegmentsToContour_Reduce(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	TreeScanDeviceSegmentSetup(groupIdx);
+}
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void SegmentsToContour_DwSweep(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint SegmentCount = CBuffer_CachedArgs_SegmentCounter;
+
+	uint4 scanAddrs = GetTreeScanIndices(groupIdx, gIdx);
+	uint2 dataAB = uint2(
+		GetData(scanAddrs.x, SegmentCount),
+		GetData(scanAddrs.y, SegmentCount)
+	);
+
+	uint2 res = TreeScanDownSweepSegmentSetup(groupIdx, gIdx);
+	res = SCAN_OP(dataAB, res); // Make inclusive
+	res = res - 1; // recover by offset -1
+	
+	StoreData(scanAddrs.x, SegmentCount, res.x);
+	StoreData(scanAddrs.y, SegmentCount, res.y);
+
+	
+	// Configure dispatch params & Clean compute buffers for next kernel
+	///////////////////////////////////////////////////////////////////////////////
+	uint workSize = SegmentCount;
+	// LDS cache <---
+	uint numGroups = (ComputeNumGroups(workSize, GROUP_SIZE_NEXT, BITS_GROUP_SIZE_NEXT));
+	if (id.x == 0)
+	{
+		// Dispatch args
+		CBuffer_CachedArgs_ScanCounter(1) = 0;
+		CBuffer_CachedArgs_NumGroups(0) = numGroups;
+	}
+}

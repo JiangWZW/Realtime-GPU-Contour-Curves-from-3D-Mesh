@@ -1,0 +1,104 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel ResetIndirectDispatchArgs_ToStampCount
+#pragma kernel ResetIndirectDispatchArgs_ToHalfStampCount
+
+#pragma kernel ResetIndirectDispatchArgs_ToPixelEdgeCount
+#pragma kernel ResetIndirectDispatchArgs_ToHalfPixelEdgeCount
+
+// Arg Buffers
+#include "../ShaderLibrary/ComputeBufferConfigs/ArgsBuffers/CBuffer_CachedArgs_View.hlsl"
+#include "../ShaderLibrary/ComputeBufferConfigs/ArgsBuffers/CBuffer_DispatchIndirectArgs_View.hlsl"
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgsPerStamp;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgsTwoStamp;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgsPerPixelEdge;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgsTwoPixelEdge;
+RWStructuredBuffer<int> CBuffer_DispatchIndirectArgsPerEdgeLoop;
+
+
+void FillStampArgs()
+{
+	uint workSize = CBuffer_CachedArgs_PixelCounter;
+	uint numGroups = ComputeNumGroups(workSize, 256, 8);
+	CBuffer_DispatchIndirectArgsPerStamp[0] = numGroups;
+
+	workSize = ((CBuffer_CachedArgs_PixelCounter + 1) >> 1);
+	numGroups = ComputeNumGroups(workSize, 256, 8);
+	CBuffer_DispatchIndirectArgsTwoStamp[0] = numGroups;
+}
+
+void FillPixelEdgeArgs()
+{
+	uint worksize = CBuffer_CachedArgs_PixelEdgeCounter;
+	uint numGroups = ComputeNumGroups(worksize, 256, 8);
+	CBuffer_DispatchIndirectArgsPerPixelEdge[0] = numGroups;
+
+	worksize = ((CBuffer_CachedArgs_PixelEdgeCounter + 1) >> 1);
+	numGroups = ComputeNumGroups(worksize, 256, 8);
+	CBuffer_DispatchIndirectArgsTwoPixelEdge[0] = numGroups;
+}
+
+
+[numthreads(32, 1, 1)]
+void ResetIndirectDispatchArgs_ToStampCount(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint StampCount = CBuffer_CachedArgs_PixelCounter;
+	uint numGroups = ComputeNumGroups(StampCount, 256, 8);
+
+	if (id.x == 0)
+	{
+		FillStampArgs();
+	}
+}
+
+[numthreads(32, 1, 1)]
+void ResetIndirectDispatchArgs_ToHalfStampCount(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint StampCount = (CBuffer_CachedArgs_PixelCounter + 1) >> 1;
+	uint numGroups = ComputeNumGroups(StampCount, 256/*_NextGroupSize*/, 8/*_NextGroupBits*/);
+
+	if (id.x == 0)
+	{
+		CBuffer_DispatchIndirectArgsPerStamp[0] = numGroups;
+	}
+} 
+
+[numthreads(1, 1, 1)]
+void ResetIndirectDispatchArgs_ToPixelEdgeCount(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint StampCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	uint numGroups = ComputeNumGroups(StampCount, 256, 8);
+
+	if (id.x == 0)
+	{
+		FillPixelEdgeArgs();
+	}
+}
+
+[numthreads(1, 1, 1)]
+void ResetIndirectDispatchArgs_ToHalfPixelEdgeCount(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint StampCount = (CBuffer_CachedArgs_PixelEdgeCounter + 1) >> 1;
+	uint numGroups = ComputeNumGroups(StampCount, 256, 8);
+
+	if (id.x == 0)
+	{
+		FillPixelEdgeArgs();
+	}
+}
+

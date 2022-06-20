@@ -1,0 +1,465 @@
+﻿#pragma use_dxc
+
+#pragma kernel ContourEdgeLoopSegmentation_SetupResources
+#pragma kernel ContourEdgeLoopSegmentation_StepA
+#pragma kernel ContourEdgeLoopSegmentation_StepB
+#pragma kernel ContourEdgeLoopSegmentation_StepC
+
+#include "../ShaderLibrary/ComputeKernelConfigs/ContourEdgeLoopSegmentationComputeDefs.hlsl"
+
+// #define DEBUG_STEP_A
+// #define DEBUG_STEP_B
+// #define DEBUG_STEP_C
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture1;
+RWTexture2D<float4> _DebugTexture;
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+// -------------------------------
+
+
+int _SegmentInput;
+int _SegmentOutput;
+int _UpdateStrokeInfoToStamps;
+
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+ByteAddressBuffer CBuffer_BufferRawStampLinkage;
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+RWStructuredBuffer<int> CBuffer_StructuredTempBuffer1;
+
+#define GROUP_SIZE_SETUP 64
+[numthreads(GROUP_SIZE_SETUP, 1, 1)]
+void ContourEdgeLoopSegmentation_SetupResources(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	uint numGroupsScanKernel = // #groups of kernel using scan primitive
+		ComputeNumGroups(EdgeCount, GROUP_SIZE_0, BITS_GROUP_SIZE_0);
+	uint numGroupsThisKernel = 8;
+	// C# side _mCsKernelEdgeLoopSegmentationInit.SetupNumGroups1D(8);
+
+	uint numCleanerThreads = numGroupsThisKernel * GROUP_SIZE_SETUP;
+	InitializeLookBackTable_Add_u32_A(id, numCleanerThreads, numGroupsScanKernel);
+	InitializeLookBackTable_Add_u32_B(id, numCleanerThreads, numGroupsScanKernel);
+}
+
+
+groupshared uint LDS_PixelEdgeSegmentKeys[GROUP_SIZE_0 + 2];
+
+// ---------------------------------------------
+// Input:
+// 1. u32 seg key per edge		<<CBuffer_PixelEdgeData_SegmentKey_AddrAt>>
+// 2a. input subbuff id GPU		<<CBuffer_SubBuff_StrokeSegmentKey>>
+// 2b. input subbuff id CPU		<<_SegmentInput>>
+int ComputeInputSubbuffID()
+{
+	int subbuff = _SegmentInput; // control from CPU host
+	bool gpuControlInput = (subbuff == -1);
+	if (gpuControlInput)
+	{ // GPU device controls input sub-buffer
+		subbuff = CBuffer_SubBuff_StrokeSegmentKey;
+	}
+
+	return subbuff;
+}
+uint LoadStrokeSegmentKey(uint edgeId, uint edgeCount)
+{
+	int subbuff = ComputeInputSubbuffID();
+
+	uint segKey = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_SegmentKey_AddrAt(
+			subbuff, edgeId
+		)
+	);
+	if (edgeId >= edgeCount) { segKey = STROKE_SEG_KEY_CULLED; }
+
+	return segKey;
+}
+
+
+int ComputeOutputSubbuffID()
+{
+	int subbuff = _SegmentOutput;
+	bool gpuControlOutput = (subbuff == -1);
+	if (gpuControlOutput)
+	{
+		subbuff = CBuffer_SubBuff_StrokeSegmentOutput;
+	}
+
+	return subbuff;
+}
+void StoreStrokeSegmentInfo(
+	uint edgeId, uint edgeRank, uint stkLen,
+	bool strokeWholeEdgeLoop
+)
+{
+	int subbuff = ComputeOutputSubbuffID();
+	// Update Stroke Topo
+	CBuffer_BufferRawPixelEdgeData.Store2(
+		CBuffer_PixelEdgeData_EdgeParam_AddrAt(
+			subbuff, edgeId
+		),
+		uint2(edgeRank, stkLen)
+	);
+	
+	if ((uint)_UpdateStrokeInfoToStamps > 0u)
+	{ // Update Loop Topo Flag
+		// Some segmentation wont change loop topology
+		uint addr_edgeAttribs = 
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, edgeId);
+		uint edgeAttribsRaw = 			
+			CBuffer_BufferRawPixelEdgeData.Load(addr_edgeAttribs);
+		SetEdgeAttrib(
+			strokeWholeEdgeLoop,
+			BIT_BEG_LOOP_FLAG,
+			BIT_LEN_LOOP_FLAG,
+			edgeAttribsRaw
+		);
+		CBuffer_BufferRawPixelEdgeData.Store(addr_edgeAttribs, edgeAttribsRaw);
+	}
+}
+void UpdatePixelEdgeDrawFlag(uint edgeId, uint segKey)
+{
+	// ----------------------------------------------------------
+	// sub-slot#0 is always the slot for updated edge attribs
+	// Per-edge-attributes are updated during this & prev kernels
+	// 
+	// Store updated attributes
+	// back to slot #0 from temp-slot #_DrawFlagBufferIndex
+	bool drawFlag = (segKey != STROKE_SEG_KEY_CULLED);
+	uint addr_attrs = CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(
+		0, edgeId
+	);
+	uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(addr_attrs);
+	SetEdgeAttrib(
+		drawFlag, BIT_BEG_DRAW_FLAG, BIT_LEN_DRAW_FLAG,
+		edgeAttribs /*inout*/
+	);
+	CBuffer_BufferRawPixelEdgeData.Store(addr_attrs, edgeAttribs);
+}
+
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void ContourEdgeLoopSegmentation_StepA(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	uint numGroups =
+		ComputeNumGroups(EdgeCount, GROUP_SIZE_0, BITS_GROUP_SIZE_0);
+
+	uint gIdx_dyn, id_dyn;
+	RegisterAsDynamicBlock_Add_u32_A(groupIdx, gIdx_dyn, id_dyn);
+
+#define EdgeId (id_dyn)
+	bool validThread = EdgeId < EdgeCount;
+
+	// Load edge data
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage, EdgeId
+	);
+	bool isLoopHead = (EdgeId == edgeloop.headEdgeId);
+	bool isLoopTail = (EdgeId == edgeloop.tailEdgeId);
+
+
+	// Load Edge Visibility (if this is drawable or not)
+	// ---------------------------------------------------------
+	uint segKey = LoadStrokeSegmentKey(EdgeId, EdgeCount);
+	LDS_PixelEdgeSegmentKeys[groupIdx + 1] = segKey;
+
+	// Boundary Conditions
+	if (groupIdx == 0)
+	{
+		LDS_PixelEdgeSegmentKeys[0] =
+			LoadStrokeSegmentKey(
+				max(1u, EdgeId) - 1u,
+				EdgeCount
+			);
+	}
+	if (groupIdx == (GROUP_SIZE_0 - 1))
+	{
+		LDS_PixelEdgeSegmentKeys[GROUP_SIZE_0 + 1] =
+			LoadStrokeSegmentKey(
+				min(EdgeId + 1, EdgeCount - 1),
+				EdgeCount
+			);
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	// Load Visibilities of 2 Adjacent Edges
+	// ------------------------------------------------------------
+	// Resolve problem when neighbor edge is not linearly adjacent,
+	// only happens when this edge is head/tail of the edge-loop
+	uint headEdgeSegKey =
+		LoadStrokeSegmentKey(edgeloop.headEdgeId, EdgeCount);
+	uint tailEdgeSegKey =
+		LoadStrokeSegmentKey(edgeloop.tailEdgeId, EdgeCount);
+
+	// Determine whether this is head/tail of a new segment
+	// ---------------------------------------------------------
+
+	uint segKey_prevEdge = isLoopHead ? 
+		tailEdgeSegKey : LDS_PixelEdgeSegmentKeys[groupIdx];
+	bool isNewHead = ((segKey_prevEdge != segKey));
+	bool isSegScanHead = (isLoopHead || isNewHead);
+
+	uint segKey_nextEdge = isLoopTail ? 
+		headEdgeSegKey : LDS_PixelEdgeSegmentKeys[groupIdx + 2u];
+	bool isNewTail = ((segKey_nextEdge != segKey));
+	bool isSegScanTail = (isLoopTail || isNewTail);
+
+	uint scanVal = 1;
+
+	uint valSum_exc_block; bool hfSum_inc_block;
+	valSum_exc_block = SegScanIncBlock_Add_u32(
+		false, groupIdx, 
+		scanVal, isSegScanHead, 
+		hfSum_inc_block
+	);
+
+	AllMemoryBarrier();
+
+	uint valSum_exc = SegScanDevice_DecoupledLookBack_Add_u32_A(
+		groupIdx, numGroups, 
+		scanVal, 
+		valSum_exc_block, hfSum_inc_block, 
+		false
+	);
+
+	// Store Back Data
+	if (validThread)
+	{
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_EdgeTemp3_AddrAt(EdgeId),
+			((valSum_exc << 4u)
+				| (isSegScanHead << 3u) | (isSegScanTail << 2u)
+				| (isNewHead << 1u)		| (isNewTail))
+		);
+
+		UpdatePixelEdgeDrawFlag(EdgeId, segKey);
+
+#ifdef DEBUG_STEP_A
+		uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+		);
+		EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+
+		float2 stampCoord = (float2)
+			DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo)));
+
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+
+		float4 dbgCol = float4(
+			valSum_exc, EdgeId, 0, segKey
+		);
+
+		_DebugTexture[(int2)edgeCoord] = dbgCol;
+#endif
+
+	}
+#undef EdgeId
+}
+
+struct SegInfoTemporary
+{
+	uint edgeRank;
+	bool isSegScanHead;
+	bool isSegScanTail;
+	bool isNewSegHead;
+	bool isNewSegTail;
+};
+
+SegInfoTemporary LoadSegmentationInfoStepA(uint edgeId)
+{
+	SegInfoTemporary res;
+
+	uint dataFromLastKernel =
+		CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_EdgeTemp3_AddrAt(edgeId)
+		);
+	
+	res.edgeRank	  = (dataFromLastKernel >> 4u);
+	res.isSegScanHead = (1u & (dataFromLastKernel >> 3u));
+	res.isSegScanTail = (1u & (dataFromLastKernel >> 2u));
+	res.isNewSegHead  = (1u & (dataFromLastKernel >> 1u));
+	res.isNewSegTail  = (1u & (dataFromLastKernel));
+
+	return res;
+}
+
+void CacheStkLenStepB(uint edgeId, uint stkLen)
+{
+	CBuffer_BufferRawPixelEdgeData.Store(
+		CBuffer_PixelEdgeData_EdgeTemp4_AddrAt(edgeId),
+		stkLen
+	);
+}
+uint LoadStkLenStepB(uint edgeId)
+{
+	return CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_EdgeTemp4_AddrAt(edgeId)
+	);
+}
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void ContourEdgeLoopSegmentation_StepB(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	uint numGroups =
+		ComputeNumGroups(EdgeCount, GROUP_SIZE_0, BITS_GROUP_SIZE_0);
+
+	uint gIdx_dyn, id_dyn;
+	RegisterAsDynamicBlock_Add_u32_B(groupIdx, gIdx_dyn, id_dyn);
+
+#define ScanItemId (id_dyn)
+	bool validThread = ScanItemId < EdgeCount;
+	// inverse scan order
+	uint EdgeId = EdgeCount - 1u - ScanItemId;
+
+	SegInfoTemporary segDataTemp = 
+		LoadSegmentationInfoStepA(EdgeId);
+
+	uint scanVal = validThread ? 1u : 0u;
+	
+	bool hfSum_inc_block;
+	uint valSum_exc_block = SegScanIncBlock_Add_u32(
+		false, groupIdx,
+		scanVal, segDataTemp.isSegScanTail, 
+		hfSum_inc_block
+	);
+
+	AllMemoryBarrier();
+
+	uint valSum_exc = SegScanDevice_DecoupledLookBack_Add_u32_B(
+		groupIdx, numGroups,
+		scanVal, valSum_exc_block, hfSum_inc_block,
+		false
+	);
+	uint distToNewSegTail = valSum_exc;
+	uint edgeId_newSegTail = EdgeId + distToNewSegTail;
+	SegInfoTemporary segInfoTemp_newSegTail =
+		LoadSegmentationInfoStepA(edgeId_newSegTail);
+
+	uint newSegLen = segInfoTemp_newSegTail.edgeRank + 1u;
+
+
+	if (validThread)
+	{ // Update spring topology
+		// (circular breaks to be fixed in next kernel)
+		CacheStkLenStepB(EdgeId, newSegLen);
+
+#ifdef DEBUG_STEP_B
+		uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+		);
+		EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+
+		float2 stampCoord = (float2)
+			DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo)));
+
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+
+		float4 dbgCol = float4(
+			segDataTemp.edgeRank, 0, 0, newSegLen
+		);
+
+		_DebugTexture1[(int2)edgeCoord] = dbgCol;
+#endif
+
+	}
+}
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void ContourEdgeLoopSegmentation_StepC(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+#define EdgeId (id.x)
+	uint validThread = EdgeId < EdgeCount;
+
+	SegInfoTemporary segInfo = LoadSegmentationInfoStepA(EdgeId);
+
+	uint stkRank, stkLen;
+	stkRank = segInfo.edgeRank;
+	stkLen = LoadStkLenStepB(EdgeId);
+	uint stkHead = EdgeId - stkRank;
+	uint stkTail = stkHead + stkLen - 1u;
+
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage, 
+		EdgeId
+	);
+	bool firstSegInLoop = (stkHead == edgeloop.headEdgeId);
+	bool lastSegInLoop = (stkTail == edgeloop.tailEdgeId);
+	bool isSelfLoop = (stkLen == edgeloop.length);
+
+	[branch] if (firstSegInLoop && !isSelfLoop)
+	{
+		SegInfoTemporary loopHeadSegInfo =
+			LoadSegmentationInfoStepA(edgeloop.headEdgeId);
+		bool downflow = !(loopHeadSegInfo.isNewSegHead);
+
+		[branch] if (downflow)
+		{ // prev half segment, at the end of loop
+			uint tailSegLen = LoadStkLenStepB(edgeloop.tailEdgeId);
+			stkRank += tailSegLen; // fix seg rank
+			stkLen += tailSegLen; // fix seg len
+		}
+	}
+	[branch] if (lastSegInLoop && !isSelfLoop)
+	{
+		SegInfoTemporary loopTailSegInfo =
+			LoadSegmentationInfoStepA(edgeloop.tailEdgeId);
+		bool overflow = !(loopTailSegInfo.isNewSegTail);
+
+		[branch] if (overflow)
+		{ // next half segment, at the head of loop
+			uint headSegLen = LoadStkLenStepB(edgeloop.headEdgeId);
+			stkLen += headSegLen; // fix seg len
+		}
+	}
+
+	if (validThread)
+	{
+		StoreStrokeSegmentInfo(
+			EdgeId, stkRank, stkLen, 
+			stkLen == edgeloop.length
+		);
+
+#ifdef DEBUG_STEP_C
+		uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+		);
+		EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+
+		float2 stampCoord = (float2)
+			DecodePixelCoord(CBuffer_BufferRawStampPixels.Load(
+				CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo)));
+
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+
+		uint segkey = LoadStrokeSegmentKey(EdgeId, EdgeCount);
+
+		float4 dbgCol = 
+		float4(
+			stkRank.xxx, stkLen
+		);
+
+		_DebugTexture1[(int2)edgeCoord] = 
+			(segkey != STROKE_SEG_KEY_CULLED) ? dbgCol : 0;
+#endif
+	}
+}

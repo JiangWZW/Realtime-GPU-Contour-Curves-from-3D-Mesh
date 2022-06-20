@@ -1,0 +1,105 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel SegmentSetup_CleanDataPerSeg
+#pragma kernel SegmentSetup_ContourToSegs
+
+#include "../ShaderLibrary/ComputeKernelConfigs/SegmentSetupComputeDefs.hlsl"
+
+globallycoherent RWByteAddressBuffer CBuffer_BufferRawLookBacks;
+RWByteAddressBuffer CBuffer_BufferRawLookBacks1;
+
+ByteAddressBuffer                    CBuffer_BufferRawContourToSegment;
+
+RWStructuredBuffer<uint>             CBuffer_CachedArgs;
+RWStructuredBuffer<uint>             CBuffer_CachedArgs1;
+RWByteAddressBuffer                  CBuffer_BufferRawSegmentsToContour;
+
+// #define DEBUG 1
+#ifdef DEBUG
+    RWByteAddressBuffer CBuffer_BufferRawDebug;
+#endif
+
+#define RENDER_CANVAS
+
+groupshared uint LDS_SegmentCount;
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void SegmentSetup_CleanDataPerSeg(
+    uint3 id: SV_DispatchThreadID,
+    uint groupIndex: SV_GroupIndex
+){
+    const uint SegmentID = id.x;
+    const uint SegmentCount = CBuffer_CachedArgs_SegmentCounter;
+	
+    // Clean segsToContour buffer to 0 or trash data(out-of-range)
+    // -------------------------------------------------------------------------
+    uint strAddr = CBuffer_BufferRawSegmentsToContour_AddrAt(SegmentID);
+    uint strData = 0; // SegmentID < SegmentCount ? 0 : MAX_UINT_VAL;
+    
+    CBuffer_BufferRawSegmentsToContour.Store(strAddr, strData);
+
+    // Setup buffers for next indirect dispatch
+    // ---------------------------------------------------
+    if (id.x == 0){
+        uint workSize, numGroups;
+#ifdef RENDER_CANVAS
+        workSize = CBuffer_CachedArgs_ContourCounter + 4;
+#endif
+    	
+        numGroups = ComputeNumGroups(
+            workSize, 
+            GROUP_SIZE_1, 
+            BITS_GROUP_SIZE_1
+        );
+
+        // Clear data after SegmentAllocation.compute
+        CBuffer_CachedArgs_ScanCounter(0) = 0;
+        CBuffer_CachedArgs_NumGroups(0) = 0;
+    }
+}
+
+
+[numthreads(GROUP_SIZE_1, 1, 1)]
+void SegmentSetup_ContourToSegs (
+    uint3 id : SV_DispatchThreadID)
+{
+#define ContourIndex (id.x)
+    const uint ContourCount =
+#ifdef RENDER_CANVAS
+        CBuffer_CachedArgs_ContourCounter + 4;
+#endif
+    // Saw seeds for segment allocation
+    // ----------------------------------------------------------------------------------
+    uint ldAddr = CBuffer_BufferRawContourToSegment_AddrAt(ContourIndex);
+
+	uint2 pSumSegCounts = CBuffer_BufferRawContourToSegment.Load2(ldAddr);
+    pSumSegCounts.y = ContourIndex == ContourCount - 1 ?
+        CBuffer_CachedArgs_SegmentCounter : pSumSegCounts.y;
+	
+    uint segmentCount = pSumSegCounts.y - pSumSegCounts.x;
+	
+    uint strAddr = (pSumSegCounts.x << 2);
+    uint strData = 1 + id.x; // Add by 1 'cause 0 is flag for uninitialized data
+    if ((id.x < ContourCount) && (segmentCount != 0))
+    {
+        CBuffer_BufferRawSegmentsToContour.Store(strAddr, strData);
+    }
+
+
+    // Setup buffers for next indirect dispatch
+    // ------------------------------------------------------------------
+    // Set indirect args & clear out useless cached args generated before
+    // Each thread process x2 pieces of data
+    uint workSize = (CBuffer_CachedArgs_SegmentCounter + 1) >> 1;
+    uint numGroups = ComputeNumGroups(
+        workSize,
+        GROUP_SIZE_2,
+        BITS_GROUP_SIZE_2
+    );
+	
+    // Clean lookback table for scan ops in next kernel
+    if (id.x < max(SCAN_MAX_NUM_BLOCKS, numGroups))
+    {
+        // Clean scan-lookback table
+        CBuffer_BufferRawLookBacks.Store((id.x << 2), 0);
+    }
+}

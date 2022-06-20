@@ -1,0 +1,149 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel StrokeCoverageCulling_ParticleMarkCoverage
+#pragma kernel StrokeCoverageCulling_MarkCoverage
+#pragma use_dxc
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StrokeCoverageCullingComputeDefs.hlsl"
+
+// #define DEBUG_KERNEL_A
+// #define DEBUG_KERNEL_B
+
+
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+
+ByteAddressBuffer	CBuffer_BufferRawStampPixels;
+ByteAddressBuffer	CBuffer_BufferRawStampLinkage;
+ByteAddressBuffer	CBuffer_BufferRawStampGBuffer;
+RWByteAddressBuffer CBuffer_BufferRawFlagsPerStamp;
+
+ 
+RWByteAddressBuffer CBuffer_BufferRawPixelEdgeData;
+RWByteAddressBuffer CBuffer_BufferRawProceduralGeometry;
+#include "../ShaderLibrary/PBDParticleLoadStoreShortcuts.hlsl"
+
+StructuredBuffer<uint> CBuffer_CachedArgs;
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StrokeCoverageCulling_ParticleMarkCoverage(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+	const uint ParticleCount = CBuffer_PBDParticleCounter;
+#define ParticleId ((id.x))
+	bool validThread = ParticleId < ParticleCount;
+
+	// Spring Segment Topo
+	uint ptclState = CBuffer_BufferRawProceduralGeometry.Load(
+		CBuffer_PCG_PBD_State_AddrAt(ParticleId)
+	);
+	uint ptclRank = GetParticleState(PTCL_RANK, ptclState);
+	uint springLen = LoadSpringLength(ParticleId);
+	bool headPtcl = (ptclRank == 0);
+	bool tailPtcl = (ptclRank == springLen - 1u);
+
+	bool springCulled = LoadSegmentCullFlag(ParticleId, ParticleCount);
+
+	if (!springCulled)
+	{
+		uint2 closestStampInfo =
+			CBuffer_BufferRawProceduralGeometry.Load2(
+				CBuffer_PCG_PBD_ClosestStampDataCache_AddrAt(ParticleId)
+			);
+		// foundCloseStamp: particle has a closest enough stamp,
+		// and particle is not out of screen
+		bool foundCloseStamp; uint stampId; uint2 stampCoord;
+		DecodeClosestStampData(closestStampInfo, 
+			foundCloseStamp, stampId, stampCoord // >> out
+		);
+
+		if (foundCloseStamp)
+		{ // init as 0 in <<StampInitAttributes>>
+			CBuffer_BufferRawFlagsPerStamp.Store(
+				CBuffer_BufferRaw_StampCoverageByParticle_AddrAt(stampId), 
+				1
+			);
+		}
+	}
+
+#ifdef DEBUG_KERNEL_A
+#endif
+
+#undef ParticleId
+}
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void StrokeCoverageCulling_MarkCoverage(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID)
+{
+#define EdgeId ((id.x))
+	uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+	bool validThread = EdgeId < EdgeCount;
+	
+	uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+	);
+	bool deleted = GetEdgeAttrib(BIT_BEG_DEL_FLAG, BIT_LEN_DEL_FLAG, edgeAttribs);
+	bool drawEdge = (!deleted)
+		&& (1 == GetEdgeAttrib(BIT_BEG_DRAW_FLAG, BIT_LEN_DRAW_FLAG, edgeAttribs))
+		&& (validThread);
+	EdgeAttrib attrs = DecodeEdgeAttrib(edgeAttribs);
+	
+	uint stampCoordPacked = CBuffer_BufferRawStampPixels.Load(
+		CBuffer_BufferRawStampPixels_AddrAt(attrs.stampInfo)
+	);
+	uint stampCoverage_sdf = CBuffer_BufferRawFlagsPerStamp.Load(
+		CBuffer_BufferRaw_StampCoverageByParticle_AddrAt(attrs.stampInfo)
+	);
+	bool covered_sdf = (stampCoverage_sdf == 1u);
+
+	float2 stampCoord = DecodePixelCoord(stampCoordPacked);
+	float2 edgeCoord = stampCoord + .5 * MoveAtOppositeStamp(attrs.edgeDir);
+	
+	ParticleCoverageSample coverageInfo;
+	coverageInfo.DecodeFromTexSample(_ContourGBuffer0[stampCoord]);
+	bool covered_covTex = coverageInfo.validSample;
+
+
+	bool covered = (covered_covTex || covered_sdf);
+	bool cull = !(drawEdge && (!covered));
+
+	// Fill segmentation inputs
+	uint subbuffID_segKeyInput = 0;
+	if (id.x == 0)
+		CBuffer_SubBuff_StrokeSegmentKey = subbuffID_segKeyInput;
+	if (validThread)
+	{
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_SegmentKey_AddrAt(
+				subbuffID_segKeyInput, EdgeId
+			),
+			cull ? STROKE_SEG_KEY_CULLED : 1
+		);
+	}
+
+
+#ifdef DEBUG_KERNEL_B
+	if (validThread)
+	{
+		// Debug Color
+		float4 dbgCol = covered ? COL_G : COL_R;
+
+		// if (!covered)
+		_DebugTexture[stampCoord] = dbgCol;
+
+		dbgCol = float4(
+			coverageInfo.ptclId,
+			0, 0, covered
+		);
+		_DebugTexture1[stampCoord] = dbgCol;
+	}
+#endif
+}
+

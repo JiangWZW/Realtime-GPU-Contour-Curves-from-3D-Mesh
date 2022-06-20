@@ -1,0 +1,125 @@
+﻿#pragma kernel SegmentAllocation_UpSweep
+#pragma kernel SegmentAllocation_Reduce
+#pragma kernel SegmentAllocation_DwSweep
+
+#include "../ShaderLibrary/ComputeKernelConfigs/SegmentAllocationUpdatedComputeDefs.hlsl"
+
+#pragma use_dxc
+
+#define RENDER_CANVAS
+
+RWByteAddressBuffer       CBuffer_BufferRawLookBacks;
+RWByteAddressBuffer       CBuffer_BufferRawContourToSegment;
+RWByteAddressBuffer       CBuffer_BufferRawRasterDataPerSeg; // Temp scan buffer
+#define SCAN_BUFFER CBuffer_BufferRawRasterDataPerSeg
+
+RWStructuredBuffer<uint>  CBuffer_CachedArgs;
+RWStructuredBuffer<uint>  CBuffer_CachedArgs1;
+RWStructuredBuffer<uint>  CBuffer_DispatchIndirectArgsPerContourSegment;
+RWStructuredBuffer<uint>  CBuffer_DispatchIndirectArgsTwoContourSegment;
+// Scan
+// ---------------------------------------------
+// Inputs
+#define REDUCE_BUFFER CBuffer_BufferRawLookBacks
+
+
+uint SumOp(uint a, uint b){
+    return (a + b);
+}
+
+// Compute segment count in edge 
+// by screen length (quantized by pixels)
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void SegmentAllocation_UpSweep(
+    uint3 id : SV_DispatchThreadID,
+    uint groupIdx: SV_GroupIndex,
+    uint3 gIdx : SV_GroupID
+)
+{
+#define ScanItemIndex (id.x)
+    // -----------------------------------------------------------
+    //                      Block-Level Scan
+    uint contourCount = CBuffer_CachedArgs_ContourCounter;
+#ifdef RENDER_CANVAS
+    contourCount += 4;
+#endif
+	
+	bool isTrashData = ScanItemIndex >= contourCount;
+
+	uint scanInput = CBuffer_BufferRawContourToSegment.Load(
+        CBuffer_BufferRawContourToSegment_AddrAt(ScanItemIndex)
+    );
+    scanInput = isTrashData ? 0u : scanInput; // Redundant thread generate 0 segment
+
+    // Scan Primitive
+    Scan_UpSweep_AllocSegs(
+        false, 
+        id, groupIdx, gIdx, 
+        SCAN_BUFFER, REDUCE_BUFFER, 
+        scanInput, 
+        0, 0, 
+        contourCount
+    );
+}
+
+
+[numthreads(REDUCE_BLOCK_SIZE, 1, 1)] // TODO: make reduce group size dynamic
+void SegmentAllocation_Reduce(
+    uint3 id : SV_DispatchThreadID,
+    uint groupIdx : SV_GroupIndex
+)
+{
+    ScanReduction_AllocSegs(REDUCE_BUFFER, 0, groupIdx);
+}
+
+
+[numthreads(GROUP_SIZE_0, 1, 1)]
+void SegmentAllocation_DwSweep(
+    uint3 id : SV_DispatchThreadID,
+    uint groupIdx : SV_GroupIndex,
+    uint3 gIdx : SV_GroupID
+)
+{
+    uint ContourCount = CBuffer_CachedArgs_ContourCounter;
+#ifdef RENDER_CANVAS
+    ContourCount += 4;
+#endif
+    bool validThread = ScanItemIndex < ContourCount;
+
+
+	uint scanInput = CBuffer_BufferRawContourToSegment.Load(
+        CBuffer_BufferRawContourToSegment_AddrAt(ScanItemIndex)
+    );
+
+    uint globalSum = ScanDwSweep_AllocSegs(
+        id, gIdx,
+        SCAN_BUFFER, REDUCE_BUFFER,
+        0, 0, ContourCount
+    );
+
+	if (validThread)
+	{
+        CBuffer_BufferRawContourToSegment.Store(
+            CBuffer_BufferRawContourToSegment_AddrAt(ScanItemIndex),
+            globalSum
+        );
+	}
+   
+
+	if ((ScanItemIndex == ContourCount - 1))
+    {
+        uint segCount = globalSum + scanInput; // exc_sum -> inc_sum
+        CBuffer_CachedArgs_SegmentCounter = segCount;
+        
+        uint workSize = segCount;
+        uint numGroups = max(1, (workSize + GROUP_SIZE_NEXT) >> BITS_GROUP_SIZE_NEXT);
+        CBuffer_DispatchIndirectArgsPerContourSegment[0] = numGroups;
+
+		
+		workSize = (segCount + 1) >> 1;
+        numGroups = max(1, (workSize + GROUP_SIZE_NEXT) >> BITS_GROUP_SIZE_NEXT);
+        CBuffer_DispatchIndirectArgsTwoContourSegment[0] = numGroups;
+		
+        CBuffer_CachedArgs_NumGroups(1) = 0;
+    }
+}

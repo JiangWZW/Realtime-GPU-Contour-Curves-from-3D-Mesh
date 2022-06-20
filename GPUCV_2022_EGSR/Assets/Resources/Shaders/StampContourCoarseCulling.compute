@@ -1,0 +1,222 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// ReSharper disable All
+#pragma kernel StampContourCoarseCulling_CurrentFrame
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StampContourCoarseCullingComputeDefs.hlsl"
+
+// #define DEBUG_HISTORY_ORIENT
+
+RWStructuredBuffer<uint> CBuffer_CachedArgs;
+RWStructuredBuffer<uint> CBuffer_CachedArgs1;
+// Debug -------------------------
+RWTexture2D<float4> _DebugTexture;
+RWTexture2D<float4> _DebugTexture1;
+RWByteAddressBuffer CBuffer_BufferRawDebug;
+// -------------------------------
+
+ByteAddressBuffer CBuffer_BufferRawStampPixels;
+ByteAddressBuffer CBuffer_BufferRawFlagsPerStamp;
+ByteAddressBuffer CBuffer_BufferRawStampLinkage;
+RWByteAddressBuffer CBuffer_BufferRawRasterDataPerSeg;
+RWByteAddressBuffer CBuffer_BufferRawLookBacks;
+
+float _OrientThreshold;
+
+#define CULLING_RADIUS 16
+
+static float GaussianKernel[CULLING_RADIUS + 1] = {
+  0.0619185259738684, 
+  0.06119347290485376, 
+  0.059069681524970316, 
+  0.05569248960322494, 
+  0.051286171803460776, 
+  0.04612921397917319, 
+  0.04052513870355009, 
+  0.034773301431091475, 
+  0.029143403529086936, 
+  0.023856531990694988, 
+  0.019074217836985527, 
+  0.014895609113430939, 
+  0.011361657913288442, 
+  0.008464416216076336, 
+  0.006159199456710605, 
+  0.004377475513974219, 
+  0.0030387554924933744
+};
+
+
+void UpdateConvInfo(
+	uint step, ConvolutionData currElem, 
+	inout float2 aveStampTangent, 
+	inout uint leftChainCode
+){
+	aveStampTangent += (GaussianKernel[step] * currElem.stampTangent);
+	AppendToChainCode(currElem.EdgeDir(), /*inout*/leftChainCode);
+}
+
+[numthreads(GROUP_SIZE_CONV, 1, 1)]
+void StampContourCoarseCulling_CurrentFrame(
+	uint3 id : SV_DispatchThreadID,
+	uint groupIdx : SV_GroupIndex,
+	uint3 gIdx : SV_GroupID
+)
+{
+	const uint EdgeCount = CBuffer_CachedArgs_PixelEdgeCounter;
+#define EdgeId ((min(EdgeCount, id.x)))
+
+	// Load Edge Attribs
+	uint edgeAttribs = CBuffer_BufferRawPixelEdgeData.Load(
+		CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(0, EdgeId)
+	);
+	EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+
+	bool despeckled =
+		GetEdgeAttrib(BIT_BEG_DEL_FLAG, BIT_LEN_DEL_FLAG, edgeAttribs);
+	
+	// Load Stamp Coord
+	uint stampCoordPacked = CBuffer_BufferRawStampPixels.Load(
+		CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo));
+
+	EdgeLoopTopology edgeloop = FetchEdgeLoopTopology(
+		false, CBuffer_BufferRawStampLinkage,
+		EdgeId
+	);
+
+	float2 edgeTangent =
+		UnpackUnitVector_2D(
+			CBuffer_BufferRawPixelEdgeData.Load(
+				CBuffer_PixelEdgeData_EdgeTangent_AddrAt(EdgeId)
+			)
+		);
+
+	// --------------------------------------------------------------------------
+	// Estimate edge direction
+	// --------------------------------------------------------------------------
+	T_CONV centerElemData, convDataOrig;
+	SetupSegmentedConvolution_OrientCurrFrame(
+		gIdx, groupIdx, EdgeCount,
+		convDataOrig
+	);
+	centerElemData = convDataOrig;
+
+	
+	float2 aveStampTangent = GaussianKernel[0] * centerElemData.stampTangent;
+	uint leftChainCode = 0; uint rightChainCode = 0;
+
+	for (uint k = 1; k <= CULLING_RADIUS; ++k)
+	{
+		T_CONV currElem = LoadLDSConvData_AtLeft_OrientCurrFrame(
+			k, 
+			gIdx.x, groupIdx, edgeloop.length, edgeloop.headEdgeId
+		);
+		UpdateConvInfo(
+			k, currElem,
+			// inout ---------------------
+			aveStampTangent, leftChainCode
+		);
+
+		currElem = LoadLDSConvData_AtRight_OrientCurrFrame(
+			k,
+			gIdx.x, groupIdx, edgeloop.length, edgeloop.headEdgeId
+		);
+		UpdateConvInfo(
+			k, currElem,
+			// inout ---------------------
+			aveStampTangent, rightChainCode
+		);
+	}
+	aveStampTangent = normalize(aveStampTangent);
+
+	
+	bool orientedCurrFrame =
+		(!despeckled) &&
+		dot(aveStampTangent, edgeTangent) > _OrientThreshold;
+	
+	
+	SetEdgeAttrib(
+		(uint)orientedCurrFrame, 
+		BIT_BEG_ORIENT_FLAG, BIT_LEN_ORIENT_FLAG, 
+		edgeAttribs
+	);
+	SetEdgeAttrib(
+		(uint)0, // deprecated
+		BIT_BEG_DRAW_FLAG, BIT_LEN_DRAW_FLAG,
+		edgeAttribs
+	);
+	SetEdgeAttrib(
+		0, // deprecated
+		BIT_BEG_AMBIGUOUS, BIT_LEN_AMBIGUOUS,
+		edgeAttribs
+	);
+
+	if (id.x < EdgeCount)
+	{
+		CBuffer_BufferRawPixelEdgeData.Store(
+			CBuffer_PixelEdgeData_SerializedAttribs_AddrAt(
+				3, EdgeId
+			),
+			edgeAttribs
+		);
+
+		CBuffer_BufferRawPixelEdgeData.Store2(
+			CBuffer_PixelEdgeData_ChainCode_AddrAt(EdgeId),
+			uint2(leftChainCode, rightChainCode)
+		);
+
+		if (id.x == 0)
+		{
+			CBuffer_HistoryPixelEdgeCounter = EdgeCount;
+		}
+		
+#ifdef DEBUG_HISTORY_ORIENT
+		EdgeAttrib edgeAttribsMain = DecodeEdgeAttrib(edgeAttribs);
+		uint stampCoordPacked = CBuffer_BufferRawStampPixels.Load(
+			CBuffer_BufferRawStampPixels_AddrAt(edgeAttribsMain.stampInfo));
+		float2 stampCoord = DecodePixelCoord(stampCoordPacked);
+		float2 edgeCoord = stampCoord + MoveAtOppositeStamp(edgeAttribsMain.edgeDir);
+		float4 dbgCol = 0;
+
+		dbgCol =
+			float4(
+				(0xff000000 & leftChainCode) >> 24, 
+				(0xff000000 & rightChainCode) >> 24, 
+				0, 
+				1
+			);
+		if (orientedCurrFrame)
+		{
+			_DebugTexture[edgeCoord] = COL_G; dbgCol;
+		}
+#endif
+	}
+
+	if (id.x == 0)
+	{
+		CBuffer_HistorySampleCounter(0) = 0;
+		CBuffer_HistorySampleCounter(1) = 0;
+		CBuffer_StampDrawCallCounter = 0;
+		CBuffer_SpineCounter = 0;
+	}
+
+	if (id.x == 0)
+	{
+		uint addr = (4 << BITS_WORD_OFFSET);
+		CBuffer_BufferRawDebug.Store(
+			addr, 
+			CBuffer_CachedArgs_ContourCounter
+		);
+		addr += (1 << BITS_WORD_OFFSET);
+
+		CBuffer_BufferRawDebug.Store(
+			addr, 
+			CBuffer_CachedArgs_PixelCounter
+		);
+		addr += (1 << BITS_WORD_OFFSET);
+
+		CBuffer_BufferRawDebug.Store(
+			addr,
+			CBuffer_CachedArgs_PixelEdgeCounter
+		);
+		addr += (1 << BITS_WORD_OFFSET);
+	}
+}

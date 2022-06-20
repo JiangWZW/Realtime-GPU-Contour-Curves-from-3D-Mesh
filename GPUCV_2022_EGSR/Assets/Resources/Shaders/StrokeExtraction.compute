@@ -1,0 +1,49 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel StrokeExtraction_Binning
+
+#include "../ShaderLibrary/ComputeKernelConfigs/StrokeExtractionComputeDefs.hlsl"
+
+globallycoherent RWTexture2D<int> _PerPixelSpinLockTex;
+
+RWStructuredBuffer<uint>    CBuffer_CachedArgs;
+RWStructuredBuffer<uint>    CBuffer_CachedArgs1;
+
+ByteAddressBuffer           CBuffer_BufferRawRasterDataPerVEdge;
+StructuredBuffer<int>       CBuffer_DispatchIndirectArgs;
+StructuredBuffer<int>       CBuffer_DispatchIndirectArgs1;
+
+float4 CVector_ScreenTexelSize_SS;
+
+float2 NDCToViewport(float2 coordNDC){
+        return coordNDC * CVector_ScreenTexelSize_SS.xy;
+}
+
+[numthreads(GROUP_SIZE_0,1,1)] 
+void StrokeExtraction_Binning (uint3 id : SV_DispatchThreadID)
+{
+    const uint ViewEdgeId = id.x;
+    const uint ViewEdgeCount = CBuffer_CachedArgs_ViewEdgeCounter;
+    uint4x2 rasterData;
+    
+    // Load Per-View_Edge Raster Data
+    uint ldAddr;
+    ldAddr = CBuffer_BufferRawRasterDataPerVEdge_AddrAt(ViewEdgeId);
+    rasterData._11_21_31_41 = 
+        CBuffer_BufferRawRasterDataPerVEdge.Load4(ldAddr);
+    rasterData._12_22_32_42 = uint4(0, 0, 0, 0);
+    
+    float4 vposNDC = GET_VEDGE_RASTER_VERTS(rasterData);
+    uint4 vposSS = uint4(floor(vposNDC * CVector_ScreenTexelSize_SS.xyxy));
+    float2 eyeZ = GET_VEDGE_RASTER_LINZ(rasterData);
+
+    int lock = 0;
+    bool insidePixel = (
+        vposSS.x == vposSS.z &&
+        vposSS.y == vposSS.w
+    );
+
+    if (ViewEdgeId < ViewEdgeCount && !insidePixel){
+        InterlockedAdd(_PerPixelSpinLockTex[int2(vposSS.xy)], 1, lock);
+        InterlockedAdd(_PerPixelSpinLockTex[int2(vposSS.zw)], 1, lock);
+    }
+}
