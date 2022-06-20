@@ -6,7 +6,7 @@
 
 No existing GPU-based NPR method (inverted hull, post-processing, etc.) can generate stroke curves, essential for expressive line drawings. 
 
-*StrokeGen*, a real-time method to generate 2D curves from 3D mesh’s contour:
+*StrokeGen*, a real-time method to generate 2D curves from 3D mesh’s contour, implemented as a prototype of our paper “GPU-Driven Real-Time Mesh Contour Vectorization” at EGSR 2022.
 
 - Reaches up to 800x acceleration over CPU-based offline alternatives ([Pencil+4](https://www.psoft.co.jp/jp/product/pencil/unity/), [Line Art](https://docs.blender.org/manual/en/latest/grease_pencil/modifiers/generate/line_art.html), [Freestyle](https://docs.blender.org/manual/en/latest/render/freestyle/introduction.html#:~:text=Freestyle%20is%20an%20edge%2Fline,technical%20(hard%20line)%20looks.), [Active Strokes](https://github.com/benardp/ActiveStrokes)). 
 - High efficiency: only costs 1ms for mesh of 300k tris, under 1920x1080 screen resolution.
@@ -27,8 +27,6 @@ To run this project:
 - Click “Play”. 
 
 ## Implementation Notes
-
-​	For more details, please refer to our paper “GPU-Driven Real-Time Mesh Contour Vectorization” at EGSR 2022.
 
 ### Supported Mesh Type
 
