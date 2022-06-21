@@ -47,7 +47,7 @@ If the texture mapping doesn’t work properly, select the curve textures and re
 
 ## Compatibility
 
-Tested on Windows, with Nnvidia GPUs (GTX 1070, GTX 1080, Quadro M2000). 
+Tested on Windows, with Nvidia GPUs (GTX 1070, GTX 1080, Quadro M2000). 
 
 Any questions or problems, feel free to email jwtstone@gmail.com. 
 
