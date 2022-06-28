@@ -26,6 +26,7 @@ To run this project:
   - Official: Core RP Library, Universal RP, Unity UI, Mathematics;
   - Third Party: [Odin Inspector](https://assetstore.unity.com/packages/tools/utilities/odin-inspector-and-serializer-89041)
 - Open “Assets/Scenes/SampleScene.unity”;
+- Set screen resolution to 1920x1080; 
 - Click “Play”. 
 
 ## Implementation Notes
