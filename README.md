@@ -22,7 +22,7 @@ To run this project:
 
 - Download and install Unity Editor 2021.2.11f1 (from Unity Hub or [here](https://unity3d.com/unity/whats-new/2021.2.11));
 - Open the project, following packages are required:
-  - Official: Core RP Library, Unity UI, Universal RP;
+  - Official: Core RP Library, Universal RP, Unity UI, Mathematics;
   - Third Party: [Odin Inspector](https://assetstore.unity.com/packages/tools/utilities/odin-inspector-and-serializer-89041)
 - Open “Assets/Scenes/SampleScene.unity”;
 - Click “Play”. 
