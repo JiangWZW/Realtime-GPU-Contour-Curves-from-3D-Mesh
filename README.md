@@ -20,6 +20,7 @@ All runtime procedures are implemented on the GPU with HLSL (mainly compute shad
 
 To run this project:
 
+- Make sure that your hardware supports DX12 and HLSL Shader Model 6.0;
 - Download and install Unity Editor 2021.2.11f1 (from Unity Hub or [here](https://unity3d.com/unity/whats-new/2021.2.11));
 - Open the project, following packages are required:
   - Official: Core RP Library, Universal RP, Unity UI, Mathematics;
