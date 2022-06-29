@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "com.unity.collab-proxy": "1.15.7",
+    "com.unity.mathematics": "1.2.6",
+    "com.unity.render-pipelines.universal": "12.1.4",
+    "com.unity.test-framework": "1.1.29",
+    "com.unity.modules.ui": "1.0.0"
+  }
+}
