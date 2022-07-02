@@ -58,3 +58,7 @@ sysinfo.txt
 # Crashlytics generated file
 crashlytics-build.properties
 
+GPUCV_2022_EGSR/Library/*
+GPUCV_2022_EGSR/Temp/*
+GPUCV_2022_EGSR/Logs/*
+GPUCV_2022_EGSR/UserSettings/*
