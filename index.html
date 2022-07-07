@@ -10,6 +10,7 @@
   <link href="gwdpage_style.css" rel="stylesheet" data-version="13" data-exports-type="gwd-page">
   <link href="gwdpagedeck_style.css" rel="stylesheet" data-version="14" data-exports-type="gwd-pagedeck">
   <link href="gwdgooglead_style.css" rel="stylesheet" data-version="8" data-exports-type="gwd-google-ad">
+  <link href="gwdimage_style.css" rel="stylesheet" data-version="16" data-exports-type="gwd-image">
   <style type="text/css" id="gwd-lightbox-style">
     .gwd-lightbox {
       overflow: hidden;
@@ -86,7 +87,7 @@
       width: 597px;
       left: 242px;
       height: 33px;
-      font-size: 28px;
+      font-size: 26px;
     }
     .gwd-p-ics6 {
       position: absolute;
@@ -117,6 +118,38 @@
       font-style: italic;
       font-weight: 500;
     }
+    .gwd-image-1cc4 {
+      position: absolute;
+      transform-origin: 50% 50% 0px;
+      top: 305px;
+      left: 171px;
+      width: 737px;
+      height: 414px;
+    }
+    .gwd-span-nwo1 {
+      position: absolute;
+      top: 719px;
+      font-family: "Source Code Pro";
+      font-size: 24px;
+      left: 171px;
+      width: 737px;
+      height: 64px;
+      transform-origin: 50% 50% 0px;
+      text-align: left;
+    }
+    .gwd-img-zjrr {
+      position: absolute;
+      left: 0px;
+      width: 1080px;
+      height: 336px;
+      transform-origin: 50% 50% 0px;
+      top: 818px;
+    }
+    .gwd-span-ia33 {
+      top: 1154px;
+      left: 171px;
+      width: 737px;
+    }
   </style>
   <link href="https://fonts.googleapis.com/css?family=Source+Code+Pro:200,300,regular,500,600,700,800,900,200italic,300italic,italic,500italic,600italic,700italic,800italic,900italic" rel="stylesheet" type="text/css">
   <script data-source="googbase_min.js" data-version="4" data-exports-type="googbase" src="googbase_min.js"></script>
@@ -125,11 +158,13 @@
   <script data-source="gwdpagedeck_min.js" data-version="14" data-exports-type="gwd-pagedeck" src="gwdpagedeck_min.js"></script>
   <script data-source="https://s0.2mdn.net/ads/studio/Enabler.js" data-exports-type="gwd-google-ad" src="https://s0.2mdn.net/ads/studio/Enabler.js"></script>
   <script data-source="gwdgooglead_min.js" data-version="8" data-exports-type="gwd-google-ad" src="gwdgooglead_min.js"></script>
+  <script data-source="gwdimage_min.js" data-version="16" data-exports-type="gwd-image" src="gwdimage_min.js"></script>
 </head>
 
 <body>
   <script gwd-served-sizes="" type="application/json">["300x250"]</script>
   <gwd-google-ad id="gwd-ad" polite-load="">
+    <gwd-metric-configuration></gwd-metric-configuration>
     <gwd-pagedeck class="gwd-page-container" id="pagedeck">
       <gwd-page id="page1" class="gwd-page-wrapper gwd-page-size gwd-lightbox gwd-page-6c2y" data-gwd-width="100%" data-gwd-height="100%">
         <div class="gwd-page-content gwd-page-size gwd-div-skhg">
@@ -140,6 +175,8 @@
           </p>
           <p class="gwd-p-ics6">Guiqing Li, Yongwei Nie, Chuhua Xian</p>
           <p class="gwd-p-tr1m">In <span class="gwd-span-bf3h">Eurographics Symposium on Rendering (EGSR) 2022</span></p>
+          <gwd-image id="Abstract_Submit_Image" source="assets/Abstract Submit Image.png" scaling="stretch" class="gwd-image-1cc4"></gwd-image><span class="gwd-span-nwo1">Extrcted Curves from the 3D Mesh. <br>Different curves are colored differntly,</span><span class="gwd-span-nwo1 gwd-span-ia33">Time per frame, compare with existing alternatives.<br>Our Method achieves superior performance.</span>
+          <gwd-image source="assets/image.png" class="gwd-img-zjrr" id="image"></gwd-image>
         </div>
       </gwd-page>
     </gwd-pagedeck>
