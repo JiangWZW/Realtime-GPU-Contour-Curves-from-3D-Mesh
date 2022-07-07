@@ -10,6 +10,7 @@
   <link href="gwdpage_style.css" rel="stylesheet" data-version="13" data-exports-type="gwd-page">
   <link href="gwdpagedeck_style.css" rel="stylesheet" data-version="14" data-exports-type="gwd-pagedeck">
   <link href="gwdgooglead_style.css" rel="stylesheet" data-version="8" data-exports-type="gwd-google-ad">
+  <link href="gwdimage_style.css" rel="stylesheet" data-version="16" data-exports-type="gwd-image">
   <style type="text/css" id="gwd-lightbox-style">
     .gwd-lightbox {
       overflow: hidden;
@@ -18,6 +19,11 @@
   <style type="text/css" id="gwd-text-style">
     p {
       margin: 0px;
+      font-family: "Source Code Pro";
+      font-size: 24px;
+      font-style: italic;
+      font-weight: 500;
+      text-align: center;
     }
     h1 {
       margin: 0px;
@@ -55,22 +61,101 @@
       width: 1080px;
       height: 3000px;
     }
-    .gwd-span-81ca {
+    .gwd-span-alen {
       position: absolute;
-      left: 54px;
-      top: 28px;
-      width: 984px;
-      height: 1598px;
+      top: 40px;
+      width: 890.667px;
+      height: 93.3333px;
+      left: 95px;
+      font-family: "Source Code Pro";
+      text-align: center;
+      font-size: 38px;
+      font-weight: 900;
+    }
+    .gwd-span-jl2s {
+      position: absolute;
+      top: 133px;
+      width: 793px;
       transform-origin: 50% 50% 0px;
-      font-size: 32px;
+      left: 144px;
+      font-weight: 500;
+      font-style: italic;
+      height: 62px;
+      font-size: 26px;
+    }
+    .gwd-p-1b73 {
+      position: absolute;
+      text-align: left;
+      height: 38px;
+      transform-origin: 50% 50% 0px;
+      font-size: 30px;
+      font-style: normal;
+      font-weight: bold;
+      top: 251px;
+      left: 95px;
+      width: 891px;
+    }
+    .gwd-p-1xo2 {
+      position: absolute;
+      top: 289px;
+      font-style: normal;
+      text-align: left;
+      font-weight: normal;
+      left: 95px;
+      transform-origin: 50% 50% 0px;
+      width: 891px;
+      font-size: 26px;
+      height: 1000px;
+    }
+    .gwd-image-1pii {
+      position: absolute;
+      transform-origin: 50% 50% 0px;
+      top: 1308px;
+      left: 624px;
+      width: 361px;
+      height: 689px;
+    }
+    .gwd-image-yahx {
+      position: absolute;
+      transform-origin: 50% 50% 0px;
+      left: 95px;
+      top: 1308px;
+      width: 516px;
+      height: 689px;
+    }
+    .gwd-span-1t9g {
+      position: absolute;
+      left: 95px;
+      top: 1997px;
+      width: 890px;
+      text-align: left;
+      height: 62px;
+      transform-origin: 50% 50% 0px;
+      font-weight: normal;
+      font-style: normal;
+    }
+    .gwd-img-1eax {
+      position: absolute;
+      transform-origin: 50% 50% 0px;
+      width: 1080px;
+      height: 342px;
+      top: 2106px;
+      left: 0px;
+    }
+    .gwd-p-1o39 {
+      top: 2448px;
+      width: 939px;
+      left: 71px;
     }
   </style>
+  <link href="https://fonts.googleapis.com/css?family=Source+Code+Pro:200,300,regular,500,600,700,800,900,200italic,300italic,italic,500italic,600italic,700italic,800italic,900italic" rel="stylesheet" type="text/css">
   <script data-source="googbase_min.js" data-version="4" data-exports-type="googbase" src="googbase_min.js"></script>
   <script data-source="gwd_webcomponents_v1_min.js" data-version="2" data-exports-type="gwd_webcomponents_v1" src="gwd_webcomponents_v1_min.js"></script>
   <script data-source="gwdpage_min.js" data-version="13" data-exports-type="gwd-page" src="gwdpage_min.js"></script>
   <script data-source="gwdpagedeck_min.js" data-version="14" data-exports-type="gwd-pagedeck" src="gwdpagedeck_min.js"></script>
   <script data-source="https://s0.2mdn.net/ads/studio/Enabler.js" data-exports-type="gwd-google-ad" src="https://s0.2mdn.net/ads/studio/Enabler.js"></script>
   <script data-source="gwdgooglead_min.js" data-version="8" data-exports-type="gwd-google-ad" src="gwdgooglead_min.js"></script>
+  <script data-source="gwdimage_min.js" data-version="16" data-exports-type="gwd-image" src="gwdimage_min.js"></script>
 </head>
 
 <body>
@@ -78,7 +163,26 @@
     <gwd-metric-configuration></gwd-metric-configuration>
     <gwd-pagedeck class="gwd-page-container" id="pagedeck">
       <gwd-page id="page1" class="gwd-page-wrapper gwd-page-size gwd-lightbox" data-gwd-width="1080px" data-gwd-height="3000px">
-        <div class="gwd-page-content gwd-page-size"><span class="gwd-span-81ca">Rendering contours of 3D meshes has a wide range of applications. Previous CPU-based contour rendering algorithms support advanced stylized effects but cannot achieve realtime performance. On the other hand, real-time algorithms based on GPU have to sacrifice some advanced stylization effects due to the difficulty of linking contour elements into stroke curves. This paper proposes a GPU-based mesh contour rendering method which includes the following steps: (1) before rendering, a preprocessing step analyzes the adjacency and geometric information from the 3d mesh model; (2) at runtime, an extraction stage firstly selects contour edges from the 3D mesh model, then the parallelized Bresenham algorithm rasterizes the contour edges into a set of oriented contour pixels; (3) next, Potrace is parallelized to extract (pixel) edge loops from the contour pixels; (4) subsequently, a novel segmentation procedure is designed to partition the edge loops into strokes; (5) finally, these strokes are then converted into 2D strip meshes in order to support rendering with controllable styles. Except the preprocessing step, all other procedures are implemented in parallel on a GPU. This enables our framework to achieve real-time performance for high-resolution rendering of dense mesh models.&nbsp;<br><br><br><br>Contour of 3D meshes, which reveals the essential shape of objects, plays a crucial role in painting and other arts. In particular, stylized contours are essential for artistic expression. That is why contour rendering which extracts and stylizes contours of 3D meshes has long been a fundamental topic in non-photorealistic rendering (NPR).</span></div>
+        <div class="gwd-page-content gwd-page-size">
+          <h1 class="gwd-span-alen">GPU-Driven Real-Time <br>Mesh Contour Vectorization</h1>
+          <p class="gwd-span-jl2s"><a href="https://jiangwzw.github.io/">Wangziwei Jiang</a>, Guiqing Li, Yongwei Nie, Chuhua Xian</p>
+          <p class="gwd-p-1b73">Abstract</p>
+          <p class="gwd-p-1xo2">Rendering contours of 3D meshes has a wide range of applications.<br>
+            <br>
+            Previous CPU-based contour rendering algorithms support advanced stylized effects but cannot achieve realtime performance.<br>
+            On the other hand, real-time algorithms based on GPU have to sacrifice some advanced stylization effects due to the difficulty of linking contour elements into stroke curves.<br>
+            <br>
+            This paper proposes a GPU-based mesh contour rendering method which includes the following steps: (1) before rendering, a preprocessing step analyzes the adjacency and geometric information from the 3d mesh model; (2) at runtime, an extraction stage firstly selects contour edges from the 3D mesh model, then the parallelized Bresenham algorithm rasterizes the contour edges into a set of oriented contour pixels; (3) next, Potrace is parallelized to extract (pixel) edge loops from the contour pixels; (4) subsequently, a novel segmentation procedure is designed to partition the edge loops into strokes; (5) finally, these strokes are then converted into 2D strip meshes in order to support rendering with controllable styles.<br>
+            <br>
+            Except the preprocessing step, all other procedures are implemented in parallel on a GPU. This enables our framework to achieve real-time performance for high-resolution rendering of dense mesh models.&nbsp;</p>
+          <gwd-image id="Lucy_Strokes" source="assets/Lucy Strokes.png" scaling="stretch" class="gwd-image-1pii"></gwd-image>
+          <gwd-image id="Castle_Strokes" source="assets/Castle Strokes.png" scaling="stretch" class="gwd-image-yahx"></gwd-image>
+          <p class="gwd-span-1t9g">Extracted curves from 3D mesh.<br>
+            Curves are rendered with different colors.</p>
+          <p class="gwd-span-1t9g gwd-p-1o39">Time per frame.<br>
+            Our method achieves superior performance than existing works.&nbsp;</p>
+          <gwd-image source="assets/image_1.png" class="gwd-img-1eax" id="image_1"></gwd-image>
+        </div>
       </gwd-page>
     </gwd-pagedeck>
   </gwd-google-ad>
