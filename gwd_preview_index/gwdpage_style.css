@@ -1,0 +1,1 @@
+gwd-page{display:block}.gwd-inactive{visibility:hidden}
