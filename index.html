@@ -121,10 +121,10 @@
     .gwd-image-1cc4 {
       position: absolute;
       transform-origin: 50% 50% 0px;
-      top: 305px;
-      left: 171px;
-      width: 737px;
-      height: 414px;
+      left: 5px;
+      width: 1075px;
+      height: 605px;
+      top: 1069px;
     }
     .gwd-span-nwo1 {
       position: absolute;
@@ -143,12 +143,44 @@
       width: 1080px;
       height: 336px;
       transform-origin: 50% 50% 0px;
-      top: 818px;
+      top: 1773px;
     }
     .gwd-span-ia33 {
-      top: 1154px;
       left: 171px;
       width: 737px;
+      top: 2109px;
+    }
+    .gwd-span-xbll {
+      top: 1674px;
+    }
+    .gwd-span-jecn {
+      position: absolute;
+      font-family: "Source Code Pro";
+      transform-origin: 50% 50% 0px;
+      text-align: left;
+      font-weight: bold;
+      width: 852px;
+      height: 33px;
+      top: 294px;
+      left: 66px;
+      font-size: 26px;
+    }
+    .gwd-span-125k {
+      font-weight: normal;
+    }
+    .gwd-span-16z3 {
+      font-size: 24px;
+    }
+    .gwd-span-196w {
+      position: absolute;
+      top: 327px;
+      font-family: "Source Code Pro";
+      font-size: 24px;
+      transform-origin: 50% 50% 0px;
+      font-weight: normal;
+      width: 960px;
+      left: 66px;
+      height: 732px;
     }
   </style>
   <link href="https://fonts.googleapis.com/css?family=Source+Code+Pro:200,300,regular,500,600,700,800,900,200italic,300italic,italic,500italic,600italic,700italic,800italic,900italic" rel="stylesheet" type="text/css">
@@ -175,9 +207,10 @@
           </p>
           <p class="gwd-p-ics6">Guiqing Li, Yongwei Nie, Chuhua Xian</p>
           <p class="gwd-p-tr1m">In <span class="gwd-span-bf3h">Eurographics Symposium on Rendering (EGSR) 2022</span></p>
-          <gwd-image id="Abstract_Submit_Image" source="assets/Abstract Submit Image.png" scaling="stretch" class="gwd-image-1cc4"></gwd-image><span class="gwd-span-nwo1">Extrcted Curves from the 3D Mesh. <br>Different curves are colored differntly,</span><span class="gwd-span-nwo1 gwd-span-ia33">Time per frame, compare with existing alternatives.<br>Our Method achieves superior performance.</span>
-          <gwd-image source="assets/image.png" class="gwd-img-zjrr" id="image"></gwd-image>
-        </div>
+          <gwd-image id="Abstract_Submit_Image" source="assets/Abstract Submit Image.png" scaling="stretch" class="gwd-image-1cc4"></gwd-image><span class="gwd-span-nwo1 gwd-span-xbll">Extrcted Curves from the 3D Mesh. <br>Different curves are colored differntly,</span><span class="gwd-span-nwo1 gwd-span-ia33">Time per frame, compare with existing alternatives.<br>Our Method achieves superior performance.</span>
+          <gwd-image source="assets/image.png" class="gwd-img-zjrr" id="image"></gwd-image><span class="gwd-span-jecn"><span class="gwd-span-16z3">Abstract<br></span><br>
+          
+          </span><span class="gwd-span-196w">Rendering contours of 3D meshes has a wide range of applications. <br>Previous CPU-based contour rendering algorithms support advanced stylized effects but cannot achieve realtime performance. On the other hand, real-time algorithms based on GPU have to sacrifice some advanced stylization effects due to the difficulty of linking contour elements into stroke curves. <br><br>This paper proposes a GPU-based mesh contour rendering method which includes the following steps: (1) before rendering, a preprocessing step analyzes the adjacency and geometric information from the 3d mesh model; (2) at runtime, an extraction stage firstly selects contour edges from the 3D mesh model, then the parallelized Bresenham algorithm rasterizes the contour edges into a set of oriented contour pixels; (3) next, Potrace is parallelized to extract (pixel) edge loops from the contour pixels; (4) subsequently, a novel segmentation procedure is designed to partition the edge loops into strokes; (5) finally, these strokes are then converted into 2D strip meshes in order to support rendering with controllable styles. <br><br>Except the preprocessing step, all other procedures are implemented in parallel on a GPU. This enables our framework to achieve real-time performance for high-resolution rendering of dense mesh models.&nbsp;<br></span></div>
       </gwd-page>
     </gwd-pagedeck>
   </gwd-google-ad>
