@@ -1,0 +1,1 @@
+gwd-attached{display:none}
