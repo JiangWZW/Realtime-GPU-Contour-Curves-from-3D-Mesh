@@ -247,18 +247,18 @@ body {
             This paper proposes a GPU-based mesh contour rendering method which includes the following steps: (1) before rendering, a preprocessing step analyzes the adjacency and geometric information from the 3d mesh model; (2) at runtime, an extraction stage firstly selects contour edges from the 3D mesh model, then the parallelized Bresenham algorithm rasterizes the contour edges into a set of oriented contour pixels; (3) next, Potrace is parallelized to extract (pixel) edge loops from the contour pixels; (4) subsequently, a novel segmentation procedure is designed to partition the edge loops into strokes; (5) finally, these strokes are then converted into 2D strip meshes in order to support rendering with controllable styles.<br>
             <br>
             Except the preprocessing step, all other procedures are implemented in parallel on a GPU. This enables our framework to achieve real-time performance for high-resolution rendering of dense mesh models.&nbsp;</p>
-          <gwd-image id="Lucy_Strokes" source="Lucy_Strokes.png?1657201957896" scaling="stretch" class="gwd-image-1pii"></gwd-image>
-          <gwd-image id="Castle_Strokes" source="Castle_Strokes.png?1657201957896" scaling="stretch" class="gwd-image-yahx"></gwd-image>
+          <gwd-image id="Lucy_Strokes" source="Lucy_Strokes.png?1657201985156" scaling="stretch" class="gwd-image-1pii"></gwd-image>
+          <gwd-image id="Castle_Strokes" source="Castle_Strokes.png?1657201985156" scaling="stretch" class="gwd-image-yahx"></gwd-image>
           <p class="gwd-span-1t9g gwd-p-ej3i">Extracted curves from 3D mesh.<br>
             Curves are rendered with different colors.</p>
           <p class="gwd-span-1t9g gwd-p-1o39">Time per frame.<br>
             Our method achieves superior performance than existing works.&nbsp;</p>
-          <gwd-image source="image_1.png?1657201957896" class="gwd-img-1eax" id="image_1"></gwd-image>
+          <gwd-image source="image_1.png?1657201985156" class="gwd-img-1eax" id="image_1"></gwd-image>
           <p class="gwd-span-pmh7"><span class="gwd-span-1sro">Resources</span></p>
-          <p class="gwd-p-ivt3"><a href="/assets/GPUCV_EGSR2022.pdf">Paper</a>(PDF)</p>
+          <p class="gwd-p-ivt3"><a href="./assets/GPUCV_EGSR2022.pdf">Paper</a>(PDF)</p>
           <p class="gwd-p-k60m">Presentation Video(14 min)</p>
           <p class="gwd-p-1ed2"><a href="https://github.com/JiangWZW/Realtime-GPU-Contour-Curves-from-3D-Mesh">Uinty project on Github</a></p>
-          <gwd-image id="GitHub-Mark-120px-plus" source="GitHub-Mark-120px-plus.png?1657201957896" scaling="stretch" class="gwd-image-8n4i"></gwd-image>
+          <gwd-image id="GitHub-Mark-120px-plus" source="GitHub-Mark-120px-plus.png?1657201985156" scaling="stretch" class="gwd-image-8n4i"></gwd-image>
         </div>
       </gwd-page>
     </gwd-pagedeck>
